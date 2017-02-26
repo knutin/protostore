@@ -14,3 +14,6 @@ chrono = "0.3.0"
 mio = "0.6.4"
 slab = "0.3.0"
 eventfd = { git = "https://github.com/knutin/eventfd-rust.git" }
+byteorder = "1.0.0"
+uuid = {version = "0.3.1", features = ["v4"]}
+rand = "0.3"

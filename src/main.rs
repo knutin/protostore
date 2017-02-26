@@ -7,18 +7,23 @@ extern crate chrono;
 extern crate mio;
 extern crate eventfd;
 extern crate slab;
-
+extern crate byteorder;
+extern crate uuid;
+extern crate rand;
 
 
 use std::io;
+use std::mem;
 use std::str;
 use std::iter;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Write, Read};
 use std::collections::HashMap;
 
 use std::ops::Drop;
+
+use std::sync::Arc;
 
 use futures::{future, Future, Complete, Oneshot, BoxFuture, Async, Poll};
 use futures::stream::{Stream, Fuse};
@@ -26,100 +31,20 @@ use futures::sync::mpsc::{unbounded, UnboundedSender, UnboundedReceiver};
 use tokio_core::reactor::{Core, Handle, PollEvented};
 
 use eventfd::EventFD;
-
 use std::os::unix::io::AsRawFd;
-
-
-use tokio_core::io::{Codec, EasyBuf};
-use tokio_proto::pipeline::ServerProto;
-use tokio_core::io::{Io, Framed};
-use tokio_service::Service;
-
-use tokio_proto::TcpServer;
-
 use libaio::raw::{Iocontext, IoOp};
 use chrono::Duration;
 
 use slab::Slab;
 
-pub struct LineCodec;
-pub struct LineProto;
-pub struct Echo;
+use tokio_service::Service;
+use tokio_proto::TcpServer;
 
 
+use byteorder::{BigEndian, ByteOrder};
 
-
-impl Codec for LineCodec {
-    type In = String;
-    type Out = String;
-
-    fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
-        if let Some(i) = buf.as_slice().iter().position(|&b| b == b'\n') {
-            // remove the serialized frame from the buffer.
-            let line = buf.drain_to(i);
-
-            // Also remove the '\n'
-            buf.drain_to(1);
-
-            // Turn this data into a UTF string and return it in a Frame.
-            match str::from_utf8(line.as_slice()) {
-                Ok(s) => Ok(Some(s.to_string())),
-                Err(_) => Err(io::Error::new(io::ErrorKind::Other,
-                                             "invalid UTF-8")),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn encode(&mut self, msg: String, buf: &mut Vec<u8>)
-              -> io::Result<()>
-    {
-        buf.extend(msg.as_bytes());
-        buf.push(b'\n');
-        Ok(())
-    }
-
-}
-
-
-
-impl<T: Io + 'static> ServerProto<T> for LineProto {
-    /// For this protocol style, `Request` matches the codec `In` type
-    type Request = String;
-
-    /// For this protocol style, `Response` matches the coded `Out` type
-    type Response = String;
-
-    /// A bit of boilerplate to hook in the codec:
-    type Transport = Framed<T, LineCodec>;
-    type BindTransport = Result<Self::Transport, io::Error>;
-    fn bind_transport(&self, io: T) -> Self::BindTransport {
-        Ok(io.framed(LineCodec))
-    }
-}
-
-
-impl Service for Echo {
-    // These types must match the corresponding protocol types:
-    type Request = String;
-    type Response = String;
-
-    // For non-streaming protocols, service errors are always io::Error
-    type Error = io::Error;
-
-    // The future for computing the response; box it for simplicity.
-    type Future = BoxFuture<Self::Response, Self::Error>;
-
-    // Produce a future for computing a response from a request.
-    fn call(&self, req: Self::Request) -> Self::Future {
-        // In this case, the response is immediate.
-        let response = "dummy".to_string();
-
-        future::ok(response).boxed()
-    }
-}
-
+mod tcp;
+use tcp::LineProto;
 
 
 enum Message {
@@ -148,9 +73,9 @@ struct HandleEntry {
 }
 
 
-
+#[derive(Clone)]
 struct AioSession {
-    tx: RefCell<UnboundedSender<Message>>
+    pub tx: UnboundedSender<Message>
 }
 
 
@@ -180,7 +105,7 @@ impl AioSession {
            panic!("error while processing request: {:?}", e);
        }));
 
-       Ok(AioSession { tx: RefCell::new(tx) })
+       Ok(AioSession { tx: tx })
     }
 
 
@@ -188,7 +113,6 @@ impl AioSession {
         let (tx, rx) = futures::oneshot();
         println!("creating oneshot");
         self.tx
-            .borrow_mut()
             .send(Message::Execute(file, offset, buf, tx))
             .expect("driver task has gone away");
         ReadRequest { inner: rx }
@@ -275,7 +199,7 @@ impl Future for AioReader {
             match self.ctx.results(1, 10, None) {
                 Ok(res) => {
                     println!("got results");
-                    
+
                     for (op, result) in res.into_iter() {
 
                         match result {
@@ -294,17 +218,25 @@ impl Future for AioReader {
                 },
 
                 Err(e) => panic!("results failed {:?}", e),
-            }           
+            }
         };
 
-        if self.handles.is_empty() {
-            Ok(().into())
-        } else {
-            Ok(Async::NotReady)
-        }
+        // if self.handles.is_empty() {
+        //     println!("ain't got no more handles");
+        //     Ok(().into())
+        // } else {
+        //     Ok(Async::NotReady)
+        // }
+        Ok(Async::NotReady)
     }
 }
 
+
+impl Drop for AioReader {
+    fn drop(&mut self) {
+        println!("dropping aioreader");
+    }
+}
 
 
 
@@ -339,119 +271,131 @@ impl mio::Evented for AioEventFd {
 
 
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct Uuid(pub [u8; 16]);
 
-struct BigFile {
-    toc: HashMap<Uuid, usize>,
-    ctx: Iocontext<usize, Vec<u8>, Vec<u8>>,
-    datafd: File
+//type Uuid = [u8; 16];
+
+
+
+struct Protocol {
+    session: Arc<AioSession>,
+    toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
+    data: File
 }
 
+impl Service for Protocol {
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+    type Error = io::Error;
+    type Future = BoxFuture<Self::Response, Self::Error>;
 
-impl BigFile {
+    fn call(&self, req: Self::Request) -> Self::Future {
+        match self.toc.as_ref().get(&req) {
+            Some(&(offset, len)) => {
 
-    pub fn new(path: &str) -> io::Result<BigFile> {
-        // TODO: open toc from separate file, insert into hashmap
+                println!("found uuid in toc, offset {}, len {}", offset, len);
 
-        let mut io = match Iocontext::new(100) {
-            Err(e) => panic!("iocontext new {:?}", e),
-            Ok(io) => io
-        };
-        try!(io.ensure_evfd());
+                let file = self.data.try_clone().expect("Could not clone fd");
+                let buf: Vec<u8> = iter::repeat(0 as u8).take(len).collect();
 
-        let toc = HashMap::new();
-        let datafd = OpenOptions::new()
-            .read(true)
-            .open(path).unwrap();
-
-        Ok(BigFile { toc: toc, ctx: io, datafd: datafd })
-    }
-
-    pub fn read(&mut self, index: usize, len: usize) {
-        let mut rbuf: Vec<_> = iter::repeat(0 as u8).take(len).collect();
-
-        let token = 123;
-
-        // Enqueue
-        match self.ctx.pread(&self.datafd, rbuf, index as u64, token) {
-            Ok(()) => {
-
-                match self.ctx.submit() {
-                    Err(e) => panic!("submit failed {:?}", e),
-                    Ok(_) => ()
-                };
-
-                match self.ctx.results(1, 10, Some(Duration::seconds(1))) {
-                    Err(e) => panic!("results failed {:?}", e),
-                    Ok(res) => {
-                        for &(ref op, ref r) in res.iter() {
-                            match r {
-                                &Err(ref e) => panic!("{:?} failed {:?}", op, e),
-                                &Ok(res) => {
-                                    match op {
-                                        &IoOp::Pread(ref retbuf, tok) => {
-                                            println!("complete {:?}, res {:?}, buf {:?}", tok, res, retbuf);
-                                        },
-                                        _ => panic!("unexpected {:?}", op)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                self.session.read(file, offset, buf).and_then(|res| {
+                    println!("got aio response {:?}", res);
+                    future::ok(vec![1,2,3])
+                }).boxed()
             },
-            Err(e) => { panic!("pread error {:?}", e); }
+            None => future::ok(vec![0]).boxed()
         }
     }
 }
 
 
-//pub struct ReadRequest {
-//    inner: OneShot<io::Result<Vec<u8>>>
-//}
 
-
-//impl mio::Evented for BigFile {
-
-//}
 
 
 fn main() {
 
+    let toc_path = "/tmp/protostore.toc".to_owned();
+    let data_path = "/tmp/protostore.data".to_owned();
+
+    let num_cookies = 10;
 
 
-    //let addr = "0.0.0.0:12345".parse().unwrap();
-    //let server = TcpServer::new(LineProto, addr);
-    //server.serve(|| Ok(Echo));
-
-    let path = "/tmp/protostore.data";
-
+    // Generate dummy data
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path).unwrap();
+        println!("Generating dummy data in /tmp/protostore.data");
 
-        file.write_all(&vec![97, 98, 99, 100]).expect("Could not write to file");
+        use rand::distributions::{Range, IndependentSample};
+        let range = Range::new(4, 64);
+
+        let mut rng = rand::thread_rng();
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+
+        let mut toc = opts.open(toc_path).unwrap();
+        let mut data = opts.open(data_path).unwrap();
+
+        for _ in 0..num_cookies {
+            let uuid = *uuid::Uuid::new_v4().as_bytes();
+
+            let num = range.ind_sample(&mut rng);
+            let len = num * mem::size_of::<u64>();
+            let mut encoded_len = [0; 4];
+            BigEndian::write_u32(&mut encoded_len, num as u32);
+
+            toc.write_all(&uuid).expect("Could not write to toc");
+            toc.write_all(&encoded_len).expect("Could not write to toc");
+
+            let mut encoded_value = [0; 8];
+            for j in 0..num {
+                BigEndian::write_u64(&mut encoded_value, j as u64);
+                data.write_all(&encoded_value).expect("Could not write to data");
+            }
+        }
     }
 
-    let mut core = Core::new().unwrap();
-    let handle = core.handle();
 
-    let aio_session = AioSession::new(handle).unwrap();
+    println!("Creating toc hashmap");
+    let mut toc_file = OpenOptions::new().read(true).open("/tmp/protostore.toc".to_owned()).unwrap();
 
-    let file = OpenOptions::new().read(true).open(path).unwrap();
+    let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
+
+    let mut toc_buf = [0; 20];
+    let mut offset = 0;
+    while let Ok(()) = toc_file.read_exact(&mut toc_buf) {
+        let uuid = toc_buf.as_ref()[0..16].to_vec();
+        let len = BigEndian::read_u32(&toc_buf.as_ref()[16..20]) as usize;
+        toc.insert(uuid, (offset, len));
+        offset += len;
+    }
 
 
-    let buf: Vec<_> = iter::repeat(0 as u8).take(2).collect();
-    let req = aio_session.read(file, 0, buf).map(|res| {
-        println!("res {:?}", res);
-        1
+
+    let toc = Arc::new(toc);
+    println!("toc has {} entries", toc.len());
+
+
+
+
+    println!("Creating tcp event loop");
+    let addr = "0.0.0.0:12345".parse().unwrap();
+    let server = TcpServer::new(LineProto, addr);
+
+
+    server.with_handle(move |handle| {
+        let session = Arc::new(AioSession::new(handle.clone()).unwrap());
+        let tx = session.tx.clone();
+
+        let data = OpenOptions::new().read(true).open("/tmp/protostore.data".to_owned()).unwrap();
+        let toc = toc.clone();
+
+        move || {
+
+            Ok(Protocol { session: session.clone(),
+                          toc: toc.clone(),
+                          data: data.try_clone().unwrap() })
+    }
+
     });
 
-    core.run(req).unwrap();
 
 }
 
@@ -491,38 +435,5 @@ mod tests {
     //     let mut core = Core::new().unwrap();
     //     let handle = core.handle();
     // }
-
-    #[test]
-    fn session() {
-        let path = "/tmp/protostore.data";
-
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path).unwrap();
-
-            file.write_all(&vec![97, 98, 99, 100]).expect("Could not write to file");
-        }
-
-        let mut core = Core::new().unwrap();
-        let handle = core.handle();
-
-        let aio_session = AioSession::new(handle).unwrap();
-
-        let file = OpenOptions::new().read(true).open(path).unwrap();
-
-
-        let buf = Vec::with_capacity(2);
-        let req = aio_session.read(file, 0, buf).then(|(b, e)| {
-            println!("b {:?}", b);
-        });
-
-        core.run(req).unwrap();
-
-
-
-    }
 
 }
