@@ -3,7 +3,6 @@
 //extern crate byteorder;
 
 use std::io;
-use std::str;
 
 //use byteorder::BigEndian;
 use byteorder::{BigEndian, ByteOrder};

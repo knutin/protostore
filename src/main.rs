@@ -1,3 +1,6 @@
+// cargo run --bin run --  --path=/mnt/data/
+
+
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
@@ -9,17 +12,16 @@ extern crate eventfd;
 extern crate slab;
 extern crate byteorder;
 extern crate uuid;
-extern crate rand;
-
+extern crate clap;
 
 use std::io;
 use std::mem;
 use std::str;
 use std::iter;
-use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
-use std::io::{Write, Read};
+use std::io::Read;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use std::ops::Drop;
 
@@ -28,12 +30,11 @@ use std::sync::Arc;
 use futures::{future, Future, Complete, Oneshot, BoxFuture, Async, Poll};
 use futures::stream::{Stream, Fuse};
 use futures::sync::mpsc::{unbounded, UnboundedSender, UnboundedReceiver};
-use tokio_core::reactor::{Core, Handle, PollEvented};
+use tokio_core::reactor::{Handle, PollEvented};
 
 use eventfd::EventFD;
 use std::os::unix::io::AsRawFd;
 use libaio::raw::{Iocontext, IoOp};
-use chrono::Duration;
 
 use slab::Slab;
 
@@ -42,6 +43,8 @@ use tokio_proto::TcpServer;
 
 
 use byteorder::{BigEndian, ByteOrder};
+
+use clap::{App, Arg};
 
 mod tcp;
 use tcp::LineProto;
@@ -111,7 +114,6 @@ impl AioSession {
 
     pub fn read(&self, file: File, offset: usize, buf: Vec<u8>) -> ReadRequest {
         let (tx, rx) = futures::oneshot();
-        println!("creating oneshot");
         self.tx
             .send(Message::Execute(file, offset, buf, tx))
             .expect("driver task has gone away");
@@ -125,14 +127,10 @@ impl Future for ReadRequest {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        println!("polling readrequest");
         match self.inner.poll().expect("complete canceled") {
             Async::Ready(Ok(res)) => Ok(res.into()),
             Async::Ready(Err(res)) => panic!("readrequest.poll failed"),
-            Async::NotReady => {
-                println!("readrequest not ready");
-                Ok(Async::NotReady)
-            }
+            Async::NotReady =>  Ok(Async::NotReady)
         }
     }
 }
@@ -143,8 +141,6 @@ impl Future for AioReader {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<(), io::Error> {
-        println!("AioReader.poll");
-
         // TODO: Batch up requests and submit in one call. Only allow
         // a certain queue depth, otherwise callers should block.
 
@@ -160,27 +156,23 @@ impl Future for AioReader {
             let (file, offset, buf, tx) = match msg {
                 Message::Execute(file, offset, buf, tx) => (file, offset, buf, tx)
             };
-            println!("executing request, file {:?}, buf {:?}", file, buf);
-
 
             let entry = self.handles.vacant_entry().expect("No more free handles!");
             let index = entry.index();
-            println!("pread index {}", index);
-
             match self.ctx.pread(&file, buf, offset as u64, index) {
                 Ok(()) => {
-                    println!("pread success, adding handler for index {}", index);
                     entry.insert(HandleEntry {
                         complete: tx
                     });
 
-                    println!("submitting");
-                    match self.ctx.submit() {
-                        Ok(_) => (),
-                        Err(e) => panic!("submit failed {:?}", e)
-                    }
+                    while self.ctx.batched() > 0 {
+                        match self.ctx.submit() {
+                            Ok(num_submitted) => { assert!(num_submitted == 1); },
+                            Err(e) => panic!("submit failed {:?}", e)
+                        };
+                    };
                 },
-                Err((buf, token)) => {
+                Err((buf, _token)) => {
                     println!("pread failed");
                     tx.complete(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed, possibly full")))));
                     continue
@@ -193,13 +185,9 @@ impl Future for AioReader {
         //println!("polling stream");
 
         if self.stream.poll_read().is_ready() {
-            println!("poll evented is ready");
-
 
             match self.ctx.results(1, 10, None) {
                 Ok(res) => {
-                    println!("got results");
-
                     for (op, result) in res.into_iter() {
 
                         match result {
@@ -290,16 +278,17 @@ impl Service for Protocol {
 
     fn call(&self, req: Self::Request) -> Self::Future {
         match self.toc.as_ref().get(&req) {
-            Some(&(offset, len)) => {
-
-                println!("found uuid in toc, offset {}, len {}", offset, len);
+            Some(&(offset, num)) => {
 
                 let file = self.data.try_clone().expect("Could not clone fd");
+                let len = num * mem::size_of::<u64>();
                 let buf: Vec<u8> = iter::repeat(0 as u8).take(len).collect();
 
-                self.session.read(file, offset, buf).and_then(|res| {
-                    println!("got aio response {:?}", res);
-                    future::ok(vec![1,2,3])
+                self.session.read(file, offset, buf).and_then(|(res, err)| {
+                    match err {
+                        Some(_) => future::ok(vec![0]).boxed(),
+                        None => future::ok(res).boxed()
+                    }
                 }).boxed()
             },
             None => future::ok(vec![0]).boxed()
@@ -313,48 +302,26 @@ impl Service for Protocol {
 
 fn main() {
 
-    let toc_path = "/tmp/protostore.toc".to_owned();
-    let data_path = "/tmp/protostore.data".to_owned();
-
-    let num_cookies = 10;
-
-
-    // Generate dummy data
-    {
-        println!("Generating dummy data in /tmp/protostore.data");
-
-        use rand::distributions::{Range, IndependentSample};
-        let range = Range::new(4, 64);
-
-        let mut rng = rand::thread_rng();
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-
-        let mut toc = opts.open(toc_path).unwrap();
-        let mut data = opts.open(data_path).unwrap();
-
-        for _ in 0..num_cookies {
-            let uuid = *uuid::Uuid::new_v4().as_bytes();
-
-            let num = range.ind_sample(&mut rng);
-            let len = num * mem::size_of::<u64>();
-            let mut encoded_len = [0; 4];
-            BigEndian::write_u32(&mut encoded_len, num as u32);
-
-            toc.write_all(&uuid).expect("Could not write to toc");
-            toc.write_all(&encoded_len).expect("Could not write to toc");
-
-            let mut encoded_value = [0; 8];
-            for j in 0..num {
-                BigEndian::write_u64(&mut encoded_value, j as u64);
-                data.write_all(&encoded_value).expect("Could not write to data");
-            }
-        }
-    }
+    let matches = App::new("mk_data")
+        .arg(Arg::with_name("path")
+             .long("path")
+             .takes_value(true)
+             .required(true)
+             .help("Directory to write datafiles"))
+        .get_matches();
 
 
-    println!("Creating toc hashmap");
-    let mut toc_file = OpenOptions::new().read(true).open("/tmp/protostore.toc".to_owned()).unwrap();
+    let path = matches.value_of("path").unwrap();
+
+    let mut toc_path = PathBuf::from(path);
+    let mut data_path = PathBuf::from(path);
+
+    toc_path.push("protostore.toc");
+    data_path.push("protostore.data");
+
+
+    println!("Reading toc file at {:?}", toc_path);
+    let mut toc_file = OpenOptions::new().read(true).open(toc_path).unwrap();
 
     let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
 
@@ -362,15 +329,13 @@ fn main() {
     let mut offset = 0;
     while let Ok(()) = toc_file.read_exact(&mut toc_buf) {
         let uuid = toc_buf.as_ref()[0..16].to_vec();
-        let len = BigEndian::read_u32(&toc_buf.as_ref()[16..20]) as usize;
-        toc.insert(uuid, (offset, len));
+        let num = BigEndian::read_u32(&toc_buf.as_ref()[16..20]) as usize;
+        let len = num * mem::size_of::<u64>();
+        toc.insert(uuid, (offset, num));
         offset += len;
     }
-
-
-
     let toc = Arc::new(toc);
-    println!("toc has {} entries", toc.len());
+    println!("Toc has {} entries", toc.len());
 
 
 
@@ -382,7 +347,6 @@ fn main() {
 
     server.with_handle(move |handle| {
         let session = Arc::new(AioSession::new(handle.clone()).unwrap());
-        let tx = session.tx.clone();
 
         let data = OpenOptions::new().read(true).open("/tmp/protostore.data".to_owned()).unwrap();
         let toc = toc.clone();
