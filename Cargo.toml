@@ -8,8 +8,8 @@ futures = "0.1"
 tokio-core = "0.1"
 tokio-service = "0.1"
 tokio-proto = "0.1"
-#libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
-libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
+libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
+#libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
 chrono = "0.3.0"
 mio = "0.6.4"
 slab = "0.3.0"
