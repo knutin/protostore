@@ -1,7 +1,10 @@
 #!/usr/bin/env escript
 % bin/benchmark.erl 127.0.0.1 12345 2 2 /mnt/data/protostore.toc
+% bin/benchmark.erl 172.18.230.186 12345 2 2 /mnt/data/protostore.toc
 
 -mode(compile).
+
+-include_lib("kernel/include/file.hrl").
 
 main([Host, Port, NumProcs, Runtime, TocFile]) ->
     %% Read uuids so we know which keys to fetch.
@@ -20,6 +23,7 @@ main([Host, Port, NumProcs, Runtime, TocFile]) ->
                      lists:seq(1, list_to_integer(NumProcs))),
 
     io:format("Running for ~p seconds~n", [list_to_integer(Runtime)]),
+    [Pid ! hammertime || Pid <- Pids],
     timer:sleep(list_to_integer(Runtime) * 1000),
 
     [Pid ! {halt, self()} || Pid <- Pids],
@@ -50,7 +54,7 @@ recv_all(L, [Pid | Pids]) ->
     receive
         {Pid, timings, Timings} ->
             recv_all([Timings | L], Pids)
-    after 1000 ->
+    after 10000 ->
             io:format("Could not receive timings from ~p~n", [Pid]),
             L
     end.
@@ -61,24 +65,30 @@ hammer(Sock, Uuids) ->
     A = lists:sublist(Uuids, Partition),
     B = lists:nthtail(Partition, Uuids),
     ReqId = 0,
+
+    receive hammertime -> ok end,
+    io:format("Process ~p: It's hammertime!~n", [self()]),
     hammer(Sock, ReqId, A, B, []).
 
 hammer(Sock, ReqId, [], L, Timings) ->
     hammer(Sock, ReqId, L, [], Timings);
 hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
-    ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),
+
     {ElapsedUs, Result} = timer:tc(
                             fun () ->
-                                    case gen_tcp:recv(Sock, 8, 5000) of
+                                    ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),
+
+                                    case gen_tcp:recv(Sock, 8, 1000) of
+                                        {ok, <<ReqId:32/unsigned-integer,  0:32/unsigned-integer>>} ->
+                                            io:format("req id ~p has len 0~n", [ReqId]),
+                                            throw(bad_response_length);
                                         {ok, <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer>>} ->
-                                            {ok, _Res} = gen_tcp:recv(Sock, Len),
-                                            %%io:format("req id ~p, '~p'~n", [ReqId, Res]),
+                                            {ok, _Res} = gen_tcp:recv(Sock, Len, 1000),
                                             ok;
                                         {error, _} = Error ->
                                             Error
                                     end
                             end),
-
     receive
         {halt, Pid} ->
             Pid ! {self(), timings, Timings}
@@ -87,7 +97,7 @@ hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
                 ok ->
                     hammer(Sock, ReqId+1, T, [Uuid | L], [ElapsedUs | Timings]);
                 Error ->
-                    throw({hammer_error, Error}),
+                    throw({hammer_error, ReqId, Error}),
                     {ok, Timings}
             end
     end.
@@ -100,13 +110,14 @@ hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
 
 read_toc(Path) ->
     io:format("Reading toc file from ~p~n", [Path]),
-    {ok, F} = file:open(Path, [read, raw, binary]),
-    do_read_toc(F, []).
 
-do_read_toc(F, L) ->
-    case file:read(F, 20) of
-        {ok, <<Uuid:16/binary, _NumEntries:32/integer>>} ->
-            do_read_toc(F, [Uuid | L]);
-        eof ->
-            L
-    end.
+    {ok, FileInfo} = file:read_file_info(Path),
+    {ok, F} = file:open(Path, [read, raw, binary]),
+    {ok, Bytes} = file:read(F, FileInfo#file_info.size),
+
+    do_read_toc(Bytes, []).
+
+do_read_toc(<<Uuid:16/binary, _NumEntries:32/integer, Rest/binary>>, L) ->
+    do_read_toc(Rest, [Uuid | L]);
+do_read_toc(<<>>, L) ->
+    L.

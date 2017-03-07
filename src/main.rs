@@ -18,7 +18,7 @@ use std::io;
 use std::mem;
 use std::str;
 use std::iter;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, metadata};
 use std::io::Read;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ use tcp::LineProto;
 
 
 enum Message {
-    Execute(File, usize, Vec<u8>, Complete<io::Result<(Vec<u8>, Option<io::Error>)>>)
+    Execute(File, usize, Vec<u8>, usize, Complete<io::Result<(Vec<u8>, Option<io::Error>)>>)
 }
 
 
@@ -112,10 +112,10 @@ impl AioSession {
     }
 
 
-    pub fn read(&self, file: File, offset: usize, buf: Vec<u8>) -> ReadRequest {
+    pub fn read(&self, file: File, offset: usize, buf: Vec<u8>, len: usize) -> ReadRequest {
         let (tx, rx) = futures::oneshot();
         self.tx
-            .send(Message::Execute(file, offset, buf, tx))
+            .send(Message::Execute(file, offset, buf, len, tx))
             .expect("driver task has gone away");
         ReadRequest { inner: rx }
     }
@@ -153,13 +153,13 @@ impl Future for AioReader {
             };
 
 
-            let (file, offset, buf, tx) = match msg {
-                Message::Execute(file, offset, buf, tx) => (file, offset, buf, tx)
+            let (file, offset, buf, len, tx) = match msg {
+                Message::Execute(file, offset, buf, len, tx) => (file, offset, buf, len, tx)
             };
 
             let entry = self.handles.vacant_entry().expect("No more free handles!");
             let index = entry.index();
-            match self.ctx.pread(&file, buf, offset as u64, index) {
+            match self.ctx.pread(&file, buf, offset as u64, len, index) {
                 Ok(()) => {
                     entry.insert(HandleEntry {
                         complete: tx
@@ -191,7 +191,7 @@ impl Future for AioReader {
                     for (op, result) in res.into_iter() {
 
                         match result {
-                            Ok(_) => {
+                            Ok(ret) => {
                                 match op {
                                     IoOp::Pread(retbuf, token) => {
                                         let entry = self.handles.remove(token).unwrap();
@@ -267,7 +267,8 @@ impl mio::Evented for AioEventFd {
 struct Protocol {
     session: Arc<AioSession>,
     toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
-    data: File
+    data: File,
+    buf: Vec<u8>
 }
 
 impl Service for Protocol {
@@ -282,9 +283,9 @@ impl Service for Protocol {
 
                 let file = self.data.try_clone().expect("Could not clone fd");
                 let len = num * mem::size_of::<u64>();
-                let buf: Vec<u8> = iter::repeat(0 as u8).take(len).collect();
+                let buf: Vec<u8> = vec![0; len];
 
-                self.session.read(file, offset, buf).and_then(|(res, err)| {
+                self.session.read(file, offset, buf, num).and_then(|(res, err)| {
                     match err {
                         Some(_) => future::ok(vec![0]).boxed(),
                         None => future::ok(res).boxed()
@@ -321,18 +322,29 @@ fn main() {
 
 
     println!("Reading toc file at {:?}", toc_path);
+    let meta = metadata(toc_path.clone()).expect("Could not read metadata for toc file");
+    let toc_size: usize = meta.len() as usize;
+
+
+
+
+    // Read the entire file at once
     let mut toc_file = OpenOptions::new().read(true).open(toc_path).unwrap();
+    //let mut toc_buf: Vec<u8> = iter::repeat(0 as u8).take(toc_size).collect();
+    let mut toc_buf: Vec<u8> = vec![0; toc_size];
+    toc_file.read_exact(&mut toc_buf).expect("Could not read toc file");
+
 
     let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
-
-    let mut toc_buf = [0; 20];
     let mut offset = 0;
-    while let Ok(()) = toc_file.read_exact(&mut toc_buf) {
-        let uuid = toc_buf.as_ref()[0..16].to_vec();
-        let num = BigEndian::read_u32(&toc_buf.as_ref()[16..20]) as usize;
+    let mut i: usize = 0;
+    while i < toc_size {
+        let uuid = toc_buf[i .. i+16].to_vec();
+        let num = BigEndian::read_u32(&toc_buf[i+16 .. i+20]) as usize;
         let len = num * mem::size_of::<u64>();
         toc.insert(uuid, (offset, num));
         offset += len;
+        i += 20;
     }
     let toc = Arc::new(toc);
     println!("Toc has {} entries", toc.len());
@@ -344,18 +356,22 @@ fn main() {
     let addr = "0.0.0.0:12345".parse().unwrap();
     let server = TcpServer::new(LineProto, addr);
 
-
+    let data_path = data_path;
     server.with_handle(move |handle| {
         let session = Arc::new(AioSession::new(handle.clone()).unwrap());
 
-        let data = OpenOptions::new().read(true).open("/tmp/protostore.data".to_owned()).unwrap();
+        let data = OpenOptions::new().read(true).open(data_path.clone()).unwrap();
         let toc = toc.clone();
+
+        let len = 10_000 * mem::size_of::<u64>();
+        let buf: Vec<u8> = iter::repeat(0 as u8).take(len).collect();
 
         move || {
 
             Ok(Protocol { session: session.clone(),
                           toc: toc.clone(),
-                          data: data.try_clone().unwrap() })
+                          data: data.try_clone().unwrap(),
+                          buf: Vec::with_capacity(len) })
     }
 
     });
