@@ -46,9 +46,8 @@ fn main() {
     let mut data_file = opts.open(data_path).unwrap();
 
 
-    use rand::distributions::{Range, IndependentSample};
-    let range = Range::new(100, 10000);
-    let mut rng = rand::thread_rng();
+    use rand::{XorShiftRng, Rng};
+    let mut rng: XorShiftRng = rand::random();
 
 
     println!("Creating toc");
@@ -56,8 +55,7 @@ fn main() {
     let mut lens = Vec::with_capacity(num_cookies as usize);
     for _ in 0..num_cookies {
         let uuid = *uuid::Uuid::new_v4().as_bytes();
-
-        let num = range.ind_sample(&mut rng);
+        let num = rng.gen_range(100, 10_000);
         lens.push(num);
 
         let mut encoded_num = [0; 4];
@@ -65,26 +63,44 @@ fn main() {
 
         toc_buf.write_all(&uuid).expect("Could not write to toc_buf");
         toc_buf.write_all(&encoded_num).expect("Could not write to toc_buf");
-        println!("uuid {:?} len {}", uuid, num);
     }
 
     println!("Writing toc buffer to disk");
     toc_file.write_all(&toc_buf).expect("Could not write toc_buf to toc_file");
 
 
+
+
+
+
     let total_entries: usize = lens.iter().sum();
     let total_bytes = total_entries * 8;
     let total_gb = total_bytes / 1024 / 1024 / 1024;
     println!("Creating data file. Need to write {} bytes, {} GB", total_bytes, total_gb);
+
+
+    let max_len = lens.iter().max().unwrap();
+    let mut dummies: Vec<u8> = vec![];
+
+    for i in 0..*max_len {
+        let mut encoded_num = [0; 8];
+        BigEndian::write_u64(&mut encoded_num, i as u64);
+        dummies.extend(encoded_num.iter());
+    }
+    println!("max {}, dummies {:?}", max_len, &dummies[0..24]);
+
+
     let mut n = 0;
     for chunk in lens.chunks(10_000) {
         println!("{} of {}", n, lens.len());
         n += chunk.len();
 
-
-        let data_buf: Vec<u64> = chunk.iter().flat_map(|len| (0..*len).map(|j| j as u64)).collect();
-        let data_buf: Vec<u8> = unsafe { mem::transmute(data_buf) };
-
+        let chunk_sum = chunk.iter().sum();
+        let mut data_buf = Vec::with_capacity(chunk_sum);
+        for len in chunk {
+            let total_len = (*len) * mem::size_of::<u64>();
+            data_buf.extend_from_slice(&dummies[0..total_len]);
+        }
         data_file.write_all(&data_buf).expect("Could not write data_buf to data_file");
     }
 }
