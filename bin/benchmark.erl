@@ -73,6 +73,7 @@ hammer(Sock, Uuids) ->
 hammer(Sock, ReqId, [], L, Timings) ->
     hammer(Sock, ReqId, L, [], Timings);
 hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
+    io:format("uuid ~p~n", [Uuid]),
 
     {ElapsedUs, Result} = timer:tc(
                             fun () ->
@@ -83,6 +84,7 @@ hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
                                             io:format("req id ~p has len 0~n", [ReqId]),
                                             throw(bad_response_length);
                                         {ok, <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer>>} ->
+                                            io:format("req id ~p has len ~p~n", [ReqId, Len]),
                                             {ok, _Res} = gen_tcp:recv(Sock, Len, 1000),
                                             ok;
                                         {error, _} = Error ->
