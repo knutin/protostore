@@ -8,7 +8,6 @@ extern crate clap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::mem;
 
 use clap::{Arg, App};
 use byteorder::{BigEndian, ByteOrder};
@@ -55,14 +54,14 @@ fn main() {
     let mut lens = Vec::with_capacity(num_cookies as usize);
     for _ in 0..num_cookies {
         let uuid = *uuid::Uuid::new_v4().as_bytes();
-        let num = rng.gen_range(100, 10_000);
-        lens.push(num);
+        let len = rng.gen_range(100, 10_000);
+        lens.push(len);
 
-        let mut encoded_num = [0; 4];
-        BigEndian::write_u32(&mut encoded_num, num as u32);
+        let mut encoded_len = [0; 4];
+        BigEndian::write_u32(&mut encoded_len, len as u32);
 
         toc_buf.write_all(&uuid).expect("Could not write to toc_buf");
-        toc_buf.write_all(&encoded_num).expect("Could not write to toc_buf");
+        toc_buf.write_all(&encoded_len).expect("Could not write to toc_buf");
     }
 
     println!("Writing toc buffer to disk");
@@ -72,9 +71,8 @@ fn main() {
 
 
 
-
     let total_entries: usize = lens.iter().sum();
-    let total_bytes = total_entries * 8;
+    let total_bytes = total_entries;
     let total_gb = total_bytes / 1024 / 1024 / 1024;
     println!("Creating data file. Need to write {} bytes, {} GB", total_bytes, total_gb);
 
@@ -83,9 +81,9 @@ fn main() {
     let mut dummies: Vec<u8> = vec![];
 
     for i in 0..*max_len {
-        let mut encoded_num = [0; 8];
-        BigEndian::write_u64(&mut encoded_num, i as u64);
-        dummies.extend(encoded_num.iter());
+        let mut encoded_len = [0; 8];
+        BigEndian::write_u64(&mut encoded_len, i as u64);
+        dummies.extend(encoded_len.iter());
     }
     println!("max {}, dummies {:?}", max_len, &dummies[0..24]);
 
@@ -98,8 +96,7 @@ fn main() {
         let chunk_sum = chunk.iter().sum();
         let mut data_buf = Vec::with_capacity(chunk_sum);
         for len in chunk {
-            let total_len = (*len) * mem::size_of::<u64>();
-            data_buf.extend_from_slice(&dummies[0..total_len]);
+            data_buf.extend_from_slice(&dummies[0..(*len)]);
         }
         data_file.write_all(&data_buf).expect("Could not write data_buf to data_file");
     }

@@ -19,6 +19,7 @@ use std::io;
 use std::mem;
 use std::str;
 use std::iter;
+use std::cmp;
 use std::fs::{File, OpenOptions, metadata};
 use std::io::Read;
 use std::collections::HashMap;
@@ -98,16 +99,17 @@ fn main() {
     let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
     let mut offset = 0;
     let mut i: usize = 0;
+    let mut max_len = 0;
     while i < toc_size {
         let uuid = toc_buf[i .. i+16].to_vec();
-        let num = BigEndian::read_u32(&toc_buf[i+16 .. i+20]) as usize;
-        let len = num * mem::size_of::<u64>();
-        toc.insert(uuid, (offset, num));
+        let len = BigEndian::read_u32(&toc_buf[i+16 .. i+20]) as usize;
+        toc.insert(uuid, (offset, len));
         offset += len;
         i += 20;
+        max_len = cmp::max(max_len, len);
     }
     let toc = Arc::new(toc);
-    println!("Toc has {} entries", toc.len());
+    println!("Toc has {} entries. Max length {}", toc.len(), max_len);
 
 
 
@@ -127,9 +129,8 @@ fn main() {
 
     let s = listener.incoming().for_each(move |(socket, addr)| {
         let data = OpenOptions::new().read(true).open(data_path.clone()).unwrap();
-        let len = 10_000 * mem::size_of::<u64>();
-        let mut buf = BytesMut::with_capacity(len);
-        unsafe { buf.set_len(len) };
+        let mut buf = BytesMut::with_capacity(max_len);
+        unsafe { buf.set_len(max_len) };
 
         let server = Server {
             session: session_handle.clone(),
@@ -141,8 +142,8 @@ fn main() {
 
         let result = server
             .serve(socket, buf)
-            .map(|_|  println!("done"))
-            .map_err(|_| println!("error"));
+            .map(|_|  println!("Connection closed"))
+            .map_err(|_| println!("Serve error"));
         handle.spawn(result);
 
         Ok(())
