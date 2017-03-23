@@ -73,7 +73,6 @@ hammer(Sock, Uuids) ->
 hammer(Sock, ReqId, [], L, Timings) ->
     hammer(Sock, ReqId, L, [], Timings);
 hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
-    io:format("uuid ~p~n", [Uuid]),
 
     {ElapsedUs, Result} = timer:tc(
                             fun () ->
@@ -81,13 +80,14 @@ hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
 
                                     case gen_tcp:recv(Sock, 8, 1000) of
                                         {ok, <<ReqId:32/unsigned-integer,  0:32/unsigned-integer>>} ->
-                                            io:format("req id ~p has len 0~n", [ReqId]),
                                             throw(bad_response_length);
                                         {ok, <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer>>} ->
-                                            io:format("req id ~p has len ~p~n", [ReqId, Len]),
                                             {ok, _Res} = gen_tcp:recv(Sock, Len, 1000),
                                             ok;
-                                        {error, _} = Error ->
+                                        {error, timeout} ->
+                                            io:format("Process ~p: timeout waiting for req id ~p, uuid ~p~n", [self(), ReqId, Uuid]),
+                                            ok;
+                                        Error ->
                                             Error
                                     end
                             end),
@@ -99,8 +99,7 @@ hammer(Sock, ReqId, [Uuid | T], L, Timings) ->
                 ok ->
                     hammer(Sock, ReqId+1, T, [Uuid | L], [ElapsedUs | Timings]);
                 Error ->
-                    throw({hammer_error, ReqId, Error}),
-                    {ok, Timings}
+                    throw({hammer_error, ReqId, Error})
             end
     end.
 

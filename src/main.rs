@@ -36,6 +36,7 @@ use futures::sync::mpsc::{unbounded, UnboundedSender, UnboundedReceiver};
 use eventfd::EventFD;
 use std::os::unix::io::AsRawFd;
 use libaio::raw::{Iocontext, IoOp};
+use libaio::{WrBuf, RdBuf};
 
 use slab::Slab;
 
@@ -60,6 +61,10 @@ use tcp::LineProto;
 
 fn main() {
 
+    //
+    // PARSE ARGUMENTS
+    //
+
     let matches = App::new("mk_data")
         .arg(Arg::with_name("path")
              .long("path")
@@ -78,19 +83,17 @@ fn main() {
     data_path.push("protostore.data");
 
 
+    //
+    // Read Table of Contents
+    //
     println!("Reading toc file at {:?}", toc_path);
     let meta = metadata(toc_path.clone()).expect("Could not read metadata for toc file");
     let toc_size: usize = meta.len() as usize;
 
-
-
-
     // Read the entire file at once
     let mut toc_file = OpenOptions::new().read(true).open(toc_path).unwrap();
-    //let mut toc_buf: Vec<u8> = iter::repeat(0 as u8).take(toc_size).collect();
     let mut toc_buf: Vec<u8> = vec![0; toc_size];
     toc_file.read_exact(&mut toc_buf).expect("Could not read toc file");
-
 
     let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
     let mut offset = 0;
@@ -108,111 +111,61 @@ fn main() {
 
 
 
+    //
+    // Create TCP listener
+    //
 
     println!("Creating tcp event loop");
     let addr = "0.0.0.0:12345".parse().unwrap();
 
-    let mut lp = Core::new().unwrap();
-    let handle = lp.handle();
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
 
     let session = Arc::new(AioSession::new(handle.clone()).unwrap());
+    let session_handle = session.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
     let s = listener.incoming().for_each(move |(socket, addr)| {
         let data = OpenOptions::new().read(true).open(data_path.clone()).unwrap();
         let len = 10_000 * mem::size_of::<u64>();
-        let buf = vec![0u8; len];
+        let mut buf = BytesMut::with_capacity(len);
+        unsafe { buf.set_len(len) };
 
         let server = Server {
-            session: session.clone(),
+            session: session_handle.clone(),
             toc: toc.clone(),
-            data: data,
-            buf: buf
+            data: data
         };
 
+        println!("Got new connection from {}", addr);
 
-        println!("Got connection");
+        let result = server
+            .serve(socket, buf)
+            .map(|_|  println!("done"))
+            .map_err(|_| println!("error"));
+        handle.spawn(result);
 
-        server.serve(socket)
-
-        // let (writer, reader) = socket.framed(Protocol).split();
-        // reader.for_each(|req| {
-        //     println!("req {:?}", req);
-        //     future::ok(())
-        // })
-
-
-
-        //handle.spawn(reader.map(|req| {
-        //    server.call(req).map(|res| writer.send(res))
-        //}).then(|_| Ok(())))
-
-        //reader.and_then(|req| future::ok(())).boxed()
-        // reader.for_each(move |req| {
-        //     println!("req {:?}", req);
-        //     //let res = server.call(req);
-
-        //     future::ok(())
-        // }).then(|_| Ok(())).into_future()
-
-        //future::ok(())
-
-        //reader.map(move |req| {
-        //    let res = server.call(req);
-        //    res.and_then(move |r| writer.send(r))
-        //})
+        Ok(())
     });
 
-
-    lp.run(s).unwrap();
-
-    // let server = TcpServer::new(LineProto, addr);
-
-    // let data_path = data_path;
-    // server.with_handle(move |handle| {
-    //     let session = Arc::new(AioSession::new(handle.clone()).unwrap());
-
-    //     let data = OpenOptions::new().read(true).open(data_path.clone()).unwrap();
-    //     let toc = toc.clone();
-
-    //     let len = 10_000 * mem::size_of::<u64>();
-    //     let buf = Arc::new(vec![0u8; len]);
-
-    //     println!("factory");
-
-    //     move || {
-    //         println!("new connection");
-    //         Ok(Protocol { session: session.clone(),
-    //                       toc: toc.clone(),
-    //                       data: data.try_clone().unwrap(),
-    //                       buf: buf.clone() })
-    //     }
-    // });
-
+    core.run(s).unwrap();
 }
-
-
-
-
 
 
 
 
 enum Message {
-    Execute(File, usize, Vec<u8>, usize, Complete<io::Result<(Vec<u8>, Option<io::Error>)>>)
+    Execute(File, usize, BytesMut, usize, Complete<io::Result<(BytesMut, Option<io::Error>)>>)
 }
-
 
 struct ReadRequest {
-    inner: Oneshot<io::Result<(Vec<u8>, Option<io::Error>)>>
+    inner: Oneshot<io::Result<(BytesMut, Option<io::Error>)>>
 }
-
 
 struct AioReader {
     rx: Fuse<UnboundedReceiver<Message>>,
     handle: Handle,
-    //ctx: Iocontext<Complete<io::Result<Vec<u8>>>, Vec<u8>, Vec<u8>>,
-    ctx: Iocontext<usize, Vec<u8>, Vec<u8>>,
+    ctx: Iocontext<usize, BytesMut, BytesMut>,
     stream: PollEvented<AioEventFd>,
 
     // Handles to outstanding requests
@@ -220,55 +173,10 @@ struct AioReader {
 }
 
 struct HandleEntry {
-    complete: Complete<io::Result<(Vec<u8>, Option<io::Error>)>>
+    complete: Complete<io::Result<(BytesMut, Option<io::Error>)>>
 }
 
 
-#[derive(Clone)]
-struct AioSession {
-    pub tx: UnboundedSender<Message>
-}
-
-
-
-
-
-//struct Protocol {
-//    session: Arc<AioSession>,
-//    toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
-//    data: File,
-//    buf: Arc<Vec<u8>>
-//}
-
-// impl Service for Protocol {
-//     type Request = Vec<u8>;
-//     type Response = Vec<u8>;
-//     type Error = io::Error;
-//     type Future = BoxFuture<Self::Response, Self::Error>;
-
-//     fn call(&self, req: Self::Request) -> Self::Future {
-//         match self.toc.as_ref().get(&req) {
-//             Some(&(offset, num)) => {
-
-//                 let file = self.data.try_clone().expect("Could not clone fd");
-//                 let len = num * mem::size_of::<u64>();
-//                 let buf: Vec<u8> = vec![0; len];
-//                 //let buf = mem::replace(&mut self.buf, vec![]);
-//                 //let buf = Arc::get_mut(&mut self.buf).unwrap();
-//                 //let buf = Arc::try_unwrap(self.buf).unwrap();
-
-//                 self.session.read(file, offset, buf, num).and_then(move |(res, err)| {
-//                     //mem::replace(&mut self.buf, res);
-//                     match err {
-//                         Some(_) => future::ok(vec![0]).boxed(),
-//                         None => future::ok(res).boxed()
-//                     }
-//                 }).boxed()
-//             },
-//             None => future::ok(vec![0]).boxed()
-//         }
-//     }
-// }
 
 #[derive(Debug)]
 struct Request {
@@ -316,56 +224,30 @@ impl Encoder for Protocol {
 
 
 struct Server {
-    session: Arc<AioSession>,
+    session: Arc<SessionHandle>,
     toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
-    data: File,
-    buf: Vec<u8>
+    data: File
 }
 
 impl Server {
-
-    //fn call(mut self, socket: TcpStream) -> Box<Future<Item=Response, Error=io::Error>> {
-    fn serve(mut self, socket: TcpStream) -> Box<Future<Item=(), Error=io::Error>> {
+    fn serve(mut self, socket: TcpStream, mut buf: BytesMut) -> Box<Future<Item=(), Error=io::Error>> {
         let framed = socket.framed(Protocol);
         let (writer, reader) = framed.split();
-
-        // println!("serving");
-        // reader.for_each(|f| {
-        //     println!("f {:?}", f);
-        //     future::ok(())
-        // }).boxed()
-
-        //future::ok(()).boxed()
-        //future::ok(Ok(())).boxed()
-        //future::err(io::Error::new(io::ErrorKind::Other, "foo")).boxed()
-            //future::ok(()).boxed()
-
-            //future::ok(()).boxed()
-
-
-        // reader.for_each(move |req| {
-        //     println!("req {:?}", req);
-        //     //let res = server.call(req);
-
-        //     future::ok(())
-        // }).then(|_| Ok(())).into_future()
-
-        //future::ok(())
+        let buf = RefCell::new(buf);
 
         let responses = reader.and_then(move |req| {
-            println!("got {:?}", req);
+            //println!("Parsed request {:?}", req);
 
-            match self.toc.get(req.uuid.as_slice()) {
+            let mybuf = buf.clone().into_inner();
+
+            match self.toc.clone().get(req.uuid.as_slice()) {
                 Some(&(offset, num)) => {
                     let file = self.data.try_clone().unwrap();
-                    let buf = mem::replace(&mut self.buf, vec![]);
 
-                    self.session.read(file, offset, buf, num).and_then(move |(buf, err)| {
-                        //mem::replace(&mut self.buf, buf);
-
+                    self.session.read(file, offset, mybuf, num).boxed().and_then(move |(buf, err)| {
                         let buflen = if err.is_none() { num } else { 0 };
-                        //let body: Vec<u8> = self.buf[0..buflen].to_vec();
                         let body: Vec<u8> = buf[0..buflen].to_vec();
+
                         let res = Response {
                             id: req.id,
                             len: buflen as u32,
@@ -384,54 +266,19 @@ impl Server {
                 }
             }
 
-            // let res = Response {
-            //     id: 123,
-            //     len: 0,
-            //     body: vec![]
-            // };
-            // println!("response {:?}", res);
-            // future::ok(res)
-            //stream::iter(vec![Ok(res)].into_iter()).into_future()
-                //writer.send(res).and_then(|_| future::ok(()))
-                //framed.send(res).and_then(|_| future::ok(()))
         });
 
         writer.send_all(responses).and_then(|_| future::ok(())).boxed()
-        //responses.for_each(|res| writer.send(res).and_then(|_| future::ok(()))).boxed()
-
-
-        // reader.map(move |req| {
-        //     match self.toc.get(req.uuid.as_slice()) {
-        //         Some(&(offset, num)) => {
-        //             let file = self.data.try_clone().unwrap();
-        //             let buf = mem::replace(&mut self.buf, vec![]);
-
-        //             self.session.read(file, offset, buf, num).and_then(move |(buf, err)| {
-        //                 mem::replace(&mut self.buf, buf);
-
-        //                 let buflen = if err.is_none() { num } else { 0 };
-        //                 let body: Vec<u8> = self.buf[0..buflen].to_vec();
-        //                 let res = Response {
-        //                     id: req.id,
-        //                     len: buflen as u32,
-        //                     body: body
-        //                 };
-
-        //                 writer.send(res).boxed()
-        //             }).boxed()
-        //         },
-
-        //         None => {
-        //             let res = Response {
-        //                 id: req.id,
-        //                 len: 0,
-        //                 body: vec![]
-        //             };
-        //             writer.send(res).boxed()
-        //         }
-        //     }
-        // }).boxed()
     }
+}
+
+
+struct AioSession {
+    tx: Arc<UnboundedSender<Message>>
+}
+
+struct SessionHandle {
+    inner: Arc<UnboundedSender<Message>>
 }
 
 
@@ -443,11 +290,8 @@ impl AioSession {
        };
        try!(ctx.ensure_evfd());
        let evfd = ctx.evfd.as_ref().unwrap().clone();
-
        let source = AioEventFd { inner: evfd };
        let stream = PollEvented::new(source, &handle).unwrap();
-
-
        let (tx, rx) = unbounded(); // TODO: bounded?
 
        handle.clone().spawn(AioReader {
@@ -460,24 +304,29 @@ impl AioSession {
            panic!("error while processing request: {:?}", e);
        }));
 
-       Ok(AioSession { tx: tx })
+       Ok(AioSession { tx: Arc::new(tx) })
     }
 
 
-    pub fn read(&self, file: File, offset: usize, buf: Vec<u8>, len: usize) -> ReadRequest {
-        let (tx, rx) = futures::oneshot();
-        self.tx
-            .clone()
-            .send(Message::Execute(file, offset, buf, len, tx))
-            .map_err(|e| panic!("driver task has gone away"));
+    pub fn handle(&self) -> Arc<SessionHandle> {
+        Arc::new(SessionHandle { inner: self.tx.clone() })
+    }
+}
 
+impl SessionHandle {
+    pub fn read(&self, file: File, offset: usize, buf: BytesMut, len: usize) -> ReadRequest {
+        let (tx, rx) = futures::oneshot();
+        //self.inner.send(Message::Execute(file, offset, buf, len, tx));
+        UnboundedSender::send(&self.inner, Message::Execute(file, offset, buf, len, tx));
         ReadRequest { inner: rx }
     }
 }
 
 
+
+
 impl Future for ReadRequest {
-    type Item = (Vec<u8>, Option<io::Error>);
+    type Item = (BytesMut, Option<io::Error>);
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -505,7 +354,6 @@ impl Future for AioReader {
                 Async::Ready(None) => break,
                 Async::NotReady => break
             };
-
 
             let (file, offset, buf, len, tx) = match msg {
                 Message::Execute(file, offset, buf, len, tx) => (file, offset, buf, len, tx)
