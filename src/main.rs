@@ -1,6 +1,3 @@
-// cargo run --bin run --  --path=/mnt/data/
-
-
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
@@ -54,11 +51,6 @@ use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
 
 use clap::{App, Arg};
-
-mod tcp;
-use tcp::LineProto;
-
-
 
 
 fn main() {
@@ -393,10 +385,6 @@ impl Future for AioReader {
             };
         };
 
-        //let event = UnparkEvent::new(
-        // task::with_unpark_event(event, || { })
-        //println!("polling stream");
-
         if self.stream.poll_read().is_ready() {
 
             match self.ctx.results(1, 10, None) {
@@ -422,12 +410,6 @@ impl Future for AioReader {
             }
         };
 
-        // if self.handles.is_empty() {
-        //     println!("ain't got no more handles");
-        //     Ok(().into())
-        // } else {
-        //     Ok(Async::NotReady)
-        // }
         Ok(Async::NotReady)
     }
 }
@@ -446,7 +428,8 @@ struct AioEventFd {
 }
 
 
-// TODO: Since we're just wrapping, could we just use the Evented trait directly on AioEventFd
+// TODO: Since we're just wrapping, could we just use the Evented
+// trait directly on AioEventFd?
 impl mio::Evented for AioEventFd {
     fn register(&self,
                 poll: &mio::Poll,
@@ -467,15 +450,4 @@ impl mio::Evented for AioEventFd {
     fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
         mio::unix::EventedFd(&self.inner.as_raw_fd()).deregister(poll)
     }
-}
-
-
-
-
-
-
-
-
-#[cfg(test)]
-mod tests {
 }

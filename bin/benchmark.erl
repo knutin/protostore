@@ -95,7 +95,7 @@ hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
                                             {ok, Len};
                                         {error, timeout} ->
                                             io:format("Process ~p: timeout waiting for req id ~p, uuid ~p~n", [self(), ReqId, Uuid]),
-                                            throw(timeout),
+                                            throw(timeout);
                                         Error ->
                                             Error
                                     end
