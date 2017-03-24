@@ -14,6 +14,8 @@ extern crate byteorder;
 extern crate uuid;
 extern crate bytes;
 extern crate clap;
+extern crate rayon;
+extern crate memmap;
 
 use std::io;
 use std::mem;
@@ -48,9 +50,8 @@ use tokio_io::AsyncRead;
 use tokio_io::codec::{FramedRead, Decoder, Encoder};
 
 use bytes::{Buf, BufMut, BytesMut, IntoBuf};
-
-
 use byteorder::{BigEndian, ByteOrder};
+use rayon::prelude::*;
 
 use clap::{App, Arg};
 
@@ -87,28 +88,37 @@ fn main() {
     //
     // Read Table of Contents
     //
-    println!("Reading toc file at {:?}", toc_path);
+    println!("Reading Table of Contents file at {:?}", toc_path);
     let meta = metadata(toc_path.clone()).expect("Could not read metadata for toc file");
     let toc_size: usize = meta.len() as usize;
 
-    // Read the entire file at once
-    let mut toc_file = OpenOptions::new().read(true).open(toc_path).unwrap();
-    let mut toc_buf: Vec<u8> = vec![0; toc_size];
-    toc_file.read_exact(&mut toc_buf).expect("Could not read toc file");
 
-    let mut toc: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
+    let toc_mmap = memmap::Mmap::open_path(toc_path, memmap::Protection::Read).expect("Could not read toc file");
+    let toc_buf: &[u8] = unsafe { toc_mmap.as_slice() };
+
+
+    let num_entries = (toc_size / 20) as u64;
+    let toc_entries = (0..num_entries)
+        .into_par_iter()
+        .map(|i| {
+            let offset = (i*20) as usize;
+            let uuid = toc_buf[offset .. offset+16].to_vec();
+            let len = BigEndian::read_u32(&toc_buf[offset+16 .. offset+20]) as usize;
+            (uuid, len)
+        })
+        .collect::<Vec<(Vec<u8>, usize)>>();
+
+    println!("Read toc. Creating HashMap");
+    let mut toc:  HashMap<Vec<u8>, (usize, usize)> = HashMap::with_capacity(num_entries as usize);
     let mut offset = 0;
-    let mut i: usize = 0;
     let mut max_len = 0;
-    while i < toc_size {
-        let uuid = toc_buf[i .. i+16].to_vec();
-        let len = BigEndian::read_u32(&toc_buf[i+16 .. i+20]) as usize;
+    for (uuid, len) in toc_entries {
         toc.insert(uuid, (offset, len));
         offset += len;
-        i += 20;
         max_len = cmp::max(max_len, len);
     }
     let toc = Arc::new(toc);
+
     println!("Toc has {} entries. Max length {}", toc.len(), max_len);
 
 

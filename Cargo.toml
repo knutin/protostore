@@ -8,8 +8,8 @@ futures = "0.1.11"
 tokio-core = "0.1.6"
 tokio-proto = "0.1.1"
 tokio-io = "0.1.0"
-#libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
-libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
+libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
+#libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
 chrono = "0.3.0"
 mio = "0.6.5"
 slab = "0.3.0"
@@ -19,6 +19,8 @@ uuid = {version = "0.3.1", features = ["v4"]}
 rand = "0.3"
 clap = "2.20.5"
 bytes = "0.4.1"
+rayon = "0.6.0"
+memmap = "0.5.0"
 
 [[bin]]
 name = "run"

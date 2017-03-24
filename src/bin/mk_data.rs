@@ -1,4 +1,4 @@
-// cargo run --bin mk_data -- --path=/mnt/data/ --num-cookies=1000000000
+// time cargo run --bin mk_data -- --path=/mnt/data/ --num-cookies=250000000 --min-size 1024 --max-size 4
 
 extern crate rand;
 extern crate uuid;
@@ -25,6 +25,17 @@ fn main() {
              .takes_value(true)
              .required(true)
              .help("Number of cookies to write in datafiles"))
+        .arg(Arg::with_name("min_size")
+             .long("min-size")
+             .takes_value(true)
+             .required(true)
+             .help("Minimum number of data per cookie, in bytes"))
+        .arg(Arg::with_name("max_size")
+             .long("max-size")
+             .takes_value(true)
+             .required(true)
+             .help("Maximum number of data per cookie, in bytes. \
+                   Values will be randomly distributed between min and max"))
         .get_matches();
 
 
@@ -38,6 +49,8 @@ fn main() {
 
 
     let num_cookies = matches.value_of("cookies").unwrap().parse::<u64>().expect("Could not parse cookies into u64");
+    let min_size = matches.value_of("min_size").unwrap().parse::<u64>().expect("Could not parse min-size");
+    let max_size = matches.value_of("max_size").unwrap().parse::<u64>().expect("Could not parse max-size");
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -49,12 +62,15 @@ fn main() {
     let mut rng: XorShiftRng = rand::random();
 
 
-    println!("Creating toc");
+    println!("Creating Table of Contents with {} uuids, \
+              with sizes randomly distributed from {} to {} bytes",
+             num_cookies, min_size, max_size);
     let mut toc_buf: Vec<u8> = Vec::with_capacity(20*num_cookies as usize);
     let mut lens = Vec::with_capacity(num_cookies as usize);
+
     for _ in 0..num_cookies {
         let uuid = *uuid::Uuid::new_v4().as_bytes();
-        let len = rng.gen_range(100, 10_000);
+        let len = rng.gen_range(min_size as usize, max_size as usize);
         lens.push(len);
 
         let mut encoded_len = [0; 4];
@@ -89,7 +105,7 @@ fn main() {
 
 
     let mut n = 0;
-    for chunk in lens.chunks(10_000) {
+    for chunk in lens.chunks(100_000) {
         println!("{} of {}", n, lens.len());
         n += chunk.len();
 
