@@ -6,6 +6,31 @@ performance improvements to be implemented, the performance is very
 interesting.
 
 
+## Architecture
+
+Keys are 16-byte opaque binaries, values can have any length. When the
+server starts up it reads a table of contents file which maps a key to
+an offset in the data file. This ToC ist stored in Rusts standard
+`HashMap`.
+
+When a read request comes in, we find the offset and key length in the
+table, then do an asynchronous read using `libaio-rust`. When the read
+is complete we can send the response to the client. While the client
+can pipeline requests, we currently do not take advantage of possible
+parallelism.
+
+This is all run in a single thread using `tokio` and `futures`. The
+server can be parallelised by introducing more event loops. There's
+also a bit more copying than is strictly necessary that could easily
+be eliminated.
+
+Interesting projects to check out:
+
+ * https://github.com/tokio-rs/tokio-core
+ * https://github.com/knutin/libaio-rust.git
+ * https://github.com/knutin/eventfd-rust.git
+
+
 ## How to run the benchmarks
 
 Install Rust, Erlang and `libaio1`.

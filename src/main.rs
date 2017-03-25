@@ -249,6 +249,7 @@ impl Server {
 
                     self.session.read(file, offset, mybuf, num).boxed().and_then(move |(buf, err)| {
                         let buflen = if err.is_none() { num } else { 0 };
+                        // TODO: This copy is unnecessary!
                         let body: Vec<u8> = buf[0..buflen].to_vec();
 
                         let res = Response {
