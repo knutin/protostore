@@ -46,7 +46,7 @@ use tokio_io::io::{read_exact, write_all};
 use tokio_io::AsyncRead;
 use tokio_io::codec::{FramedRead, Decoder, Encoder};
 
-use bytes::{Buf, BufMut, BytesMut, IntoBuf};
+use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
 
@@ -190,8 +190,8 @@ struct Request {
 #[derive(Debug)]
 struct Response {
     id: u32,
-    len: u32,
-    body: Vec<u8>
+    len: usize,
+    body: Bytes
 }
 
 struct Protocol;
@@ -217,10 +217,10 @@ impl Encoder for Protocol {
     type Error = io::Error;
 
     fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.reserve(20 + item.len as usize);
+        dst.reserve(20 + item.len);
         dst.put_u32::<BigEndian>(item.id);
-        dst.put_u32::<BigEndian>(item.len);
-        dst.put_slice(&item.body);
+        dst.put_u32::<BigEndian>(item.len as u32);
+        dst.put_slice(&item.body.slice(0, item.len));
         Ok(())
     }
 }
@@ -249,13 +249,11 @@ impl Server {
 
                     self.session.read(file, offset, mybuf, num).boxed().and_then(move |(buf, err)| {
                         let buflen = if err.is_none() { num } else { 0 };
-                        // TODO: This copy is unnecessary!
-                        let body: Vec<u8> = buf[0..buflen].to_vec();
 
                         let res = Response {
                             id: req.id,
-                            len: buflen as u32,
-                            body: body
+                            len: buflen,
+                            body: buf.freeze()
                         };
                         future::ok(res)
                     }).boxed()
@@ -264,12 +262,11 @@ impl Server {
                     let res = Response {
                         id: req.id,
                         len: 0,
-                        body: vec![]
+                        body: Bytes::new()
                     };
                     future::ok(res).boxed()
                 }
             }
-
         });
 
         writer.send_all(responses).and_then(|_| future::ok(())).boxed()
