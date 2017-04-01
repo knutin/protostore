@@ -83,6 +83,8 @@ hammer(Sock, ReqId, Toc, MaxPos, MaxPos, Timings, Lens) ->
 hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
     Uuid = binary:part(Toc, Pos*20, 16),
 
+    %% Time the full roundtrip, including sending the request and
+    %% receiveng the full response.
     {ElapsedUs, Result} = timer:tc(
                             fun () ->
                                     ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),

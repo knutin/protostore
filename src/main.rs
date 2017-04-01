@@ -1,9 +1,11 @@
+#[macro_use]
+extern crate log;
+extern crate env_logger;
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_io;
 extern crate libaio;
-extern crate chrono;
 extern crate mio;
 extern crate eventfd;
 extern crate slab;
@@ -15,45 +17,43 @@ extern crate rayon;
 extern crate memmap;
 
 use std::io;
-use std::mem;
 use std::str;
-use std::iter;
 use std::cmp;
-use std::fs::{File, OpenOptions, metadata};
-use std::io::Read;
+use std::fs::metadata;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::ops::Drop;
 use std::sync::Arc;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::time::SystemTime;
 
-use futures::{future, Future, Complete, Oneshot, BoxFuture, Async, Poll, Sink, IntoFuture};
-use futures::stream::{self, Stream, Fuse};
+use futures::{future, Future, Complete, Oneshot, BoxFuture, Async, Poll, Sink};
+use futures::stream::{Stream, Fuse};
 use futures::sync::mpsc::{unbounded, UnboundedSender, UnboundedReceiver};
-
 
 use eventfd::EventFD;
 use std::os::unix::io::AsRawFd;
 use libaio::raw::{Iocontext, IoOp};
-use libaio::{WrBuf, RdBuf};
+use libaio::directio::{DirectFile, Mode, FileAccess};
 
 use slab::Slab;
 
 use tokio_core::reactor::{Core, Handle, PollEvented};
 use tokio_core::net::{TcpStream, TcpListener};
-use tokio_io::io::{read_exact, write_all};
 use tokio_io::AsyncRead;
-use tokio_io::codec::{FramedRead, Decoder, Encoder};
+use tokio_io::codec::{Decoder, Encoder};
 
 use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
 
+
 use clap::{App, Arg};
 
 
 fn main() {
+
+    env_logger::init().unwrap();
 
     //
     // PARSE ARGUMENTS
@@ -125,19 +125,19 @@ fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let session = Arc::new(AioSession::new(handle.clone()).unwrap());
+    let datafile = DirectFile::open(data_path.clone(), Mode::Open, FileAccess::Read, 4096).expect("Could not open data file with O_DIRECT");
+    let session = Arc::new(AioSession::new(handle.clone(), datafile).unwrap());
     let session_handle = session.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
     let s = listener.incoming().for_each(move |(socket, addr)| {
-        let data = OpenOptions::new().read(true).open(data_path.clone()).unwrap();
-        let mut buf = BytesMut::with_capacity(max_len);
-        unsafe { buf.set_len(max_len) };
+        let aligned_max_len = max_len + (max_len % 512);
+        let mut buf = BytesMut::with_capacity(aligned_max_len*2);
+        unsafe { buf.set_len(aligned_max_len*2) };
 
         let server = Server {
             session: session_handle.clone(),
-            toc: toc.clone(),
-            data: data
+            toc: toc.clone()
         };
 
         println!("Got new connection from {}", addr);
@@ -158,7 +158,7 @@ fn main() {
 
 
 enum Message {
-    Execute(File, usize, BytesMut, usize, Complete<io::Result<(BytesMut, Option<io::Error>)>>)
+    Execute(usize, BytesMut, usize, Complete<io::Result<(BytesMut, Option<io::Error>)>>)
 }
 
 struct ReadRequest {
@@ -167,15 +167,16 @@ struct ReadRequest {
 
 struct AioReader {
     rx: Fuse<UnboundedReceiver<Message>>,
-    handle: Handle,
     ctx: Iocontext<usize, BytesMut, BytesMut>,
     stream: PollEvented<AioEventFd>,
+    file: DirectFile,
 
     // Handles to outstanding requests
     handles: Slab<HandleEntry>
 }
 
 struct HandleEntry {
+    timestamp: SystemTime,
     complete: Complete<io::Result<(BytesMut, Option<io::Error>)>>
 }
 
@@ -229,31 +230,30 @@ impl Encoder for Protocol {
 struct Server {
     session: Arc<SessionHandle>,
     toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
-    data: File
 }
 
 impl Server {
-    fn serve(mut self, socket: TcpStream, mut buf: BytesMut) -> Box<Future<Item=(), Error=io::Error>> {
+    fn serve(self, socket: TcpStream, buf: BytesMut) -> BoxFuture<(), io::Error> {
         let framed = socket.framed(Protocol);
         let (writer, reader) = framed.split();
         let buf = RefCell::new(buf);
 
         let responses = reader.and_then(move |req| {
-            //println!("Parsed request {:?}", req);
-
             let mybuf = buf.clone().into_inner();
 
             match self.toc.clone().get(req.uuid.as_slice()) {
-                Some(&(offset, num)) => {
-                    let file = self.data.try_clone().unwrap();
+                Some(&(offset, len)) => {
+                    let aligned_offset = offset - (offset % 512);
+                    let aligned_len = len + 512 - (len % 512);
 
-                    self.session.read(file, offset, mybuf, num).boxed().and_then(move |(buf, err)| {
-                        let buflen = if err.is_none() { num } else { 0 };
-
+                    self.session.read(aligned_offset, mybuf, aligned_len).and_then(move |(buf, err)| {
+                        let pad_start = offset - aligned_offset;
+                        let buflen = if err.is_none() { len } else { 0 };
+                        let body = buf.freeze().slice(pad_start, pad_start+buflen);
                         let res = Response {
                             id: req.id,
                             len: buflen,
-                            body: buf.freeze()
+                            body: body
                         };
                         future::ok(res)
                     }).boxed()
@@ -284,7 +284,7 @@ struct SessionHandle {
 
 
 impl AioSession {
-   pub fn new(handle: Handle) -> io::Result<AioSession> {
+   pub fn new(handle: Handle, file: DirectFile) -> io::Result<AioSession> {
        let mut ctx = match Iocontext::new(100) {
            Err(e) => panic!("iocontext new {:?}", e),
            Ok(ctx) => ctx
@@ -297,9 +297,9 @@ impl AioSession {
 
        handle.clone().spawn(AioReader {
            rx: rx.fuse(),
-           handle: handle,
            ctx: ctx,
            stream: stream,
+           file: file,
            handles: Slab::with_capacity(512)
        }.map_err(|e| {
            panic!("error while processing request: {:?}", e);
@@ -315,10 +315,10 @@ impl AioSession {
 }
 
 impl SessionHandle {
-    pub fn read(&self, file: File, offset: usize, buf: BytesMut, len: usize) -> ReadRequest {
+    pub fn read(&self, offset: usize, buf: BytesMut, len: usize) -> ReadRequest {
         let (tx, rx) = futures::oneshot();
         //self.inner.send(Message::Execute(file, offset, buf, len, tx));
-        UnboundedSender::send(&self.inner, Message::Execute(file, offset, buf, len, tx));
+        UnboundedSender::send(&self.inner, Message::Execute(offset, buf, len, tx));
         ReadRequest { inner: rx }
     }
 }
@@ -333,7 +333,7 @@ impl Future for ReadRequest {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.inner.poll().expect("complete canceled") {
             Async::Ready(Ok(res)) => Ok(res.into()),
-            Async::Ready(Err(res)) => panic!("readrequest.poll failed"),
+            Async::Ready(Err(res)) => panic!("readrequest.poll failed, {:?}", res),
             Async::NotReady =>  Ok(Async::NotReady)
         }
     }
@@ -345,8 +345,7 @@ impl Future for AioReader {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<(), io::Error> {
-        // TODO: Batch up requests and submit in one call. Only allow
-        // a certain queue depth, otherwise callers should block.
+        trace!("AioReader.poll");
 
         // Enqueue incoming requests
         loop {
@@ -356,58 +355,66 @@ impl Future for AioReader {
                 Async::NotReady => break
             };
 
-            let (file, offset, buf, len, tx) = match msg {
-                Message::Execute(file, offset, buf, len, tx) => (file, offset, buf, len, tx)
+            let (offset, buf, len, tx) = match msg {
+                Message::Execute(offset, buf, len, tx) => (offset, buf, len, tx)
             };
 
             let entry = self.handles.vacant_entry().expect("No more free handles!");
             let index = entry.index();
-            match self.ctx.pread(&file, buf, offset as u64, len, index) {
+            trace!("calling pread. offset:{} len:{}", offset, len);
+            match self.ctx.pread(&self.file, buf, offset as u64, len, index) {
                 Ok(()) => {
-                    entry.insert(HandleEntry {
-                        complete: tx
-                    });
-
-                    while self.ctx.batched() > 0 {
-                        match self.ctx.submit() {
-                            Ok(num_submitted) => { assert!(num_submitted == 1); },
-                            Err(e) => panic!("submit failed {:?}", e)
-                        };
-                    };
+                    entry.insert(HandleEntry { complete: tx, timestamp: SystemTime::now() });
                 },
                 Err((buf, _token)) => {
-                    println!("pread failed");
-                    tx.complete(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed, possibly full")))));
+                    tx.send(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed")))));
                     continue
                 }
             };
         };
 
+        trace!("submitting batch. len {}", self.ctx.batched());
+        while self.ctx.batched() > 0 {
+            if let Err(e) = self.ctx.submit() {
+                panic!("batch submit failed {:?}", e);
+            }
+        };
+
         if self.stream.poll_read().is_ready() {
-
-            match self.ctx.results(1, 10, None) {
+            trace!("calling results");
+            match self.ctx.results(1, 100, None) {
                 Ok(res) => {
+                    trace!("ctx.results len {}", res.len());
                     for (op, result) in res.into_iter() {
-
                         match result {
-                            Ok(ret) => {
+                            Ok(_) => {
                                 match op {
                                     IoOp::Pread(retbuf, token) => {
                                         let entry = self.handles.remove(token).unwrap();
-                                        entry.complete.complete(Ok((retbuf, None)));
+                                        let elapsed = entry.timestamp.elapsed().expect("Time drift!");
+                                        trace!("pread returned in {} us", ((elapsed.as_secs() * 1_000_000_000) + elapsed.subsec_nanos() as u64) / 1000);
+
+                                        entry.complete.send(Ok((retbuf, None)));
                                     },
                                     _ => ()
                                 }
                             },
-                            Err(e) => panic!("ctx.results failed {:?}", e)
+                            Err(e) => panic!("error in pread: {:?}", e)
                         }
-                    }
+                    };
                 },
 
-                Err(e) => panic!("results failed {:?}", e),
+                Err(e) => panic!("ctx.results failed: {:?}", e),
             }
         };
 
+        trace!("outstanding handles {}", self.handles.len());
+
+        if self.handles.len() > 0 {
+            self.stream.need_read();
+        }
+
+        // Keep polling forever
         Ok(Async::NotReady)
     }
 }
@@ -434,6 +441,7 @@ impl mio::Evented for AioEventFd {
                 token: mio::Token,
                 interest: mio::Ready,
                 opts: mio::PollOpt) -> io::Result<()> {
+        trace!("AioEventFd.register");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).register(poll, token, interest, opts)
     }
 
@@ -442,10 +450,12 @@ impl mio::Evented for AioEventFd {
                   token: mio::Token,
                   interest: mio::Ready,
                   opts: mio::PollOpt) -> io::Result<()> {
+        trace!("AioEventFd.reregister");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).reregister(poll, token, interest, opts)
     }
 
     fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
+        trace!("AioEventFd.deregister");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).deregister(poll)
     }
 }

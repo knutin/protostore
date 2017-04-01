@@ -10,7 +10,6 @@ tokio-proto = "0.1.1"
 tokio-io = "0.1.0"
 libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
 #libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
-chrono = "0.3.0"
 mio = "0.6.5"
 slab = "0.3.0"
 eventfd = { git = "https://github.com/knutin/eventfd-rust.git" }
@@ -21,6 +20,8 @@ clap = "2.20.5"
 bytes = "0.4.1"
 rayon = "0.6.0"
 memmap = "0.5.0"
+log = "0.3"
+env_logger = "0.3"
 
 [[bin]]
 name = "run"
