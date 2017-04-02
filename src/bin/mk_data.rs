@@ -68,8 +68,12 @@ fn main() {
     let mut toc_buf: Vec<u8> = Vec::with_capacity(20*num_cookies as usize);
     let mut lens = Vec::with_capacity(num_cookies as usize);
 
-    for _ in 0..num_cookies {
-        let uuid = *uuid::Uuid::new_v4().as_bytes();
+    let mut uuids = (0..num_cookies)
+        .map(|_| *uuid::Uuid::new_v4().as_bytes())
+        .collect::<Vec<[u8; 16]>>();
+    uuids.sort();
+
+    for uuid in uuids {
         let len = rng.gen_range(min_size as usize, max_size as usize);
         lens.push(len);
 

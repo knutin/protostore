@@ -16,6 +16,7 @@ extern crate bytes;
 extern crate clap;
 extern crate rayon;
 extern crate memmap;
+extern crate fnv;
 
 use std::io;
 use std::str;
@@ -49,6 +50,7 @@ use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
 
+use fnv::FnvHashMap;
 
 use clap::{App, Arg};
 
@@ -103,7 +105,7 @@ fn main() {
         .collect::<Vec<(Vec<u8>, usize)>>();
 
     println!("Read toc. Creating HashMap");
-    let mut toc:  HashMap<Vec<u8>, (usize, usize)> = HashMap::with_capacity(num_entries as usize);
+    let mut toc: FnvHashMap<Vec<u8>, (usize, usize)> = FnvHashMap::with_capacity_and_hasher(num_entries as usize, Default::default());
     let mut offset = 0;
     let mut max_len = 0;
     for (uuid, len) in toc_entries {
@@ -236,7 +238,7 @@ impl Encoder for Protocol {
 
 struct Server {
     session: Arc<SessionHandle>,
-    toc: Arc<HashMap<Vec<u8>, (usize, usize)>>,
+    toc: Arc<FnvHashMap<Vec<u8>, (usize, usize)>>,
 }
 
 impl Server {
