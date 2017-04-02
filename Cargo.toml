@@ -8,6 +8,7 @@ futures = "0.1.11"
 tokio-core = "0.1.6"
 tokio-proto = "0.1.1"
 tokio-io = "0.1.0"
+tokio-pool = "0.1"
 libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
 #libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
 mio = "0.6.5"

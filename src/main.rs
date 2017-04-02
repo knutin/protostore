@@ -5,6 +5,7 @@ extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_io;
+extern crate tokio_pool;
 extern crate libaio;
 extern crate mio;
 extern crate eventfd;
@@ -42,6 +43,7 @@ use tokio_core::reactor::{Core, Handle, PollEvented};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
 use tokio_io::codec::{Decoder, Encoder};
+use tokio_pool::TokioPool;
 
 use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
@@ -125,10 +127,15 @@ fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let datafile = DirectFile::open(data_path.clone(), Mode::Open, FileAccess::Read, 4096).expect("Could not open data file with O_DIRECT");
+    let datafile = DirectFile::open(data_path.clone(), Mode::Open, FileAccess::Read, 4096)
+        .expect("Could not open data file with O_DIRECT");
     let session = Arc::new(AioSession::new(handle.clone(), datafile).unwrap());
     let session_handle = session.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
+
+    let (pool, join) = TokioPool::new(1).unwrap();
+    let pool = Arc::new(pool);
+
 
     let s = listener.incoming().for_each(move |(socket, addr)| {
         let aligned_max_len = max_len + (max_len % 512);
@@ -146,7 +153,7 @@ fn main() {
             .serve(socket, buf)
             .map(|_|  println!("Connection closed"))
             .map_err(|_| println!("Serve error"));
-        handle.spawn(result);
+        pool.next_worker().spawn(move |h| result);
 
         Ok(())
     });
