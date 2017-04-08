@@ -89,11 +89,11 @@ hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
                             fun () ->
                                     ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),
 
-                                    case gen_tcp:recv(Sock, 8, 1000) of
+                                    case gen_tcp:recv(Sock, 8, 5000) of
                                         {ok, <<ReqId:32/unsigned-integer,  0:32/unsigned-integer>>} ->
                                             throw(bad_response_length);
                                         {ok, <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer>>} ->
-                                            {ok, _Res} = gen_tcp:recv(Sock, Len, 1000),
+                                            {ok, _Res} = gen_tcp:recv(Sock, Len, 5000),
                                             {ok, Len};
                                         {error, timeout} ->
                                             io:format("Process ~p: timeout waiting for req id ~p, uuid ~p~n", [self(), ReqId, Uuid]),
@@ -104,6 +104,7 @@ hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
                             end),
     receive
         {halt, Pid} ->
+            ok = gen_tcp:close(Sock),
             Pid ! {self(), results, Timings, Lens}
     after 0 ->
             case Result of

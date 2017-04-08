@@ -5,7 +5,6 @@ extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_io;
-extern crate tokio_pool;
 extern crate libaio;
 extern crate mio;
 extern crate eventfd;
@@ -16,15 +15,18 @@ extern crate bytes;
 extern crate clap;
 extern crate rayon;
 extern crate memmap;
+extern crate hwloc;
+extern crate libc;
 
 use std::io;
 use std::str;
-use std::fs::metadata;
-use std::path::PathBuf;
+use std::path::Path;
 use std::ops::Drop;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::RefCell;
 use std::time::SystemTime;
+use std::thread;
 
 use futures::{future, Future, Complete, Oneshot, BoxFuture, Async, Poll, Sink};
 use futures::stream::{Stream, Fuse};
@@ -37,15 +39,16 @@ use libaio::directio::{DirectFile, Mode, FileAccess};
 
 use slab::Slab;
 
-use tokio_core::reactor::{Core, Handle, PollEvented};
+use tokio_core::reactor::{Core, Handle, Remote, PollEvented};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
 use tokio_io::codec::{Decoder, Encoder};
-use tokio_pool::TokioPool;
 
 use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
+
+use hwloc::{Topology, ObjectType, CPUBIND_THREAD, CpuSet};
 
 use clap::{App, Arg};
 
@@ -59,11 +62,6 @@ fn main() {
     //
 
     let matches = App::new("mk_data")
-        .arg(Arg::with_name("path")
-             .long("path")
-             .takes_value(true)
-             .required(true)
-             .help("Directory to write datafiles"))
         .arg(Arg::with_name("num-threads")
              .long("num-threads")
              .takes_value(true)
@@ -71,25 +69,30 @@ fn main() {
         .get_matches();
 
 
-    let path = matches.value_of("path").unwrap();
     let num_threads = matches.value_of("num-threads").unwrap_or("4").parse::<usize>().expect("Could not parse 'num-threads'");
 
-    let mut toc_path = PathBuf::from(path);
-    let mut data_path = PathBuf::from(path);
+    let path_toc = Path::new("/mnt/data/protostore.toc");
+    let path_data = Path::new("/mnt/data/protostore.data");
 
-    toc_path.push("protostore.toc");
-    data_path.push("protostore.data");
+
+    //
+    // Figure out the cpu topology available
+    //
+    let topo = Arc::new(Mutex::new(Topology::new()));
+    let num_pu = topo.lock().unwrap().objects_with_type(&ObjectType::PU).unwrap().len();
+    let num_cores = topo.lock().unwrap().objects_with_type(&ObjectType::Core).unwrap().len();
+    println!("Found {} cores, {} processing units", num_cores, num_pu);
 
 
     //
     // Read Table of Contents
     //
-    println!("Parsing Table of Contents file at {:?}", toc_path);
-    let meta = metadata(toc_path.clone()).expect("Could not read metadata for toc file");
+    println!("Parsing Table of Contents file at {:?}", path_toc);
+    let meta = path_toc.metadata().expect("Could not read metadata for toc file");
     let toc_size: usize = meta.len() as usize;
     let num_entries = (toc_size / 20) as u64;
 
-    let toc_mmap = memmap::Mmap::open_path(toc_path, memmap::Protection::Read).expect("Could not read toc file");
+    let toc_mmap = memmap::Mmap::open_path(path_toc.clone(), memmap::Protection::Read).expect("Could not read toc file");
     let toc_buf: &[u8] = unsafe { toc_mmap.as_slice() };
 
     let offsets: Vec<usize> = (0..num_entries).map(|i| (i*20) as usize).collect();
@@ -124,21 +127,44 @@ fn main() {
     // Create TCP listener
     //
 
-    println!("Creating event loop for accepting TCP connections and AIO responses");
+    println!("Creating event loop for accepting TCP connections");
     let addr = "0.0.0.0:12345".parse().unwrap();
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     let listener = TcpListener::bind(&addr, &handle).unwrap();
 
-    let datafile = DirectFile::open(data_path.clone(), Mode::Open, FileAccess::Read, 4096)
-        .expect("Could not open data file with O_DIRECT");
-    let session = Arc::new(AioSession::new(handle, datafile).unwrap());
-    let session_handle = session.handle();
+    let (session_tx, session_rx) = mpsc::channel();
 
+    for thread_idx in 0..num_threads {
+        let path_data = path_data.clone();
+        let session_tx = session_tx.clone();
+        let topo = topo.clone();
+        thread::spawn(move || {
+            println!("Creating event loop for receiving AIO responses from the kernel, thread index {}", thread_idx);
+            let mut core = Core::new().unwrap();
+            let handle = core.handle();
+            let datafile = DirectFile::open(path_data, Mode::Open, FileAccess::Read, 4096)
+                .expect("Could not open data file with O_DIRECT");
+            let session = Arc::new(AioSession::new(handle, datafile).unwrap());
+            session_tx.send((session.handle(), core.remote()));
 
-    println!("Creating a pool of event loops for handling requests, using {} threads", num_threads);
-    let (pool, _) = TokioPool::new(num_threads).unwrap();
-    let pool = Arc::new(pool);
+            {
+                let tid = unsafe { libc::pthread_self() };
+                let mut locked_topo = topo.lock().unwrap();
+                let bind_to = cpuset_for_core(&*locked_topo, thread_idx);
+                locked_topo.set_cpubind_for_thread(tid, bind_to, CPUBIND_THREAD).unwrap();
+                let after = locked_topo.get_cpubind_for_thread(tid, CPUBIND_THREAD);
+                println!("Bound thread {} to {:?}", thread_idx, after);
+            }
+
+            loop {
+                core.turn(None)
+            };
+        });
+    }
+
+    let handles: Vec<(Arc<SessionHandle>, Remote)> = session_rx.into_iter().take(num_threads).collect();
+    let handle_index = AtomicUsize::new(0);
 
 
     let s = listener.incoming().for_each(move |(socket, addr)| {
@@ -146,8 +172,12 @@ fn main() {
         let mut buf = BytesMut::with_capacity(aligned_max_len*2);
         unsafe { buf.set_len(aligned_max_len*2) };
 
+        let next = handle_index.fetch_add(1, Ordering::SeqCst);
+        let idx = next % num_threads;
+        let (ref session, ref remote) = handles[idx];
+
         let server = Server {
-            session: session_handle.clone(),
+            session: session.clone(),
             toc_uuids: toc_uuids.clone(),
             toc_offsets: toc_offsets.clone(),
             toc_lens: toc_lens.clone(),
@@ -159,10 +189,21 @@ fn main() {
             .serve(socket, buf)
             .map(|_|  println!("Connection closed"))
             .map_err(|_| println!("Serve error"));
-        pool.next_worker().spawn(move |_| result);
+        remote.spawn(|_| result);
 
         Ok(())
     });
+
+
+    // Bind main thread to the last core
+    {
+        let tid = unsafe { libc::pthread_self() };
+        let mut locked_topo = topo.lock().unwrap();
+        let bind_to = last_core(&*locked_topo);
+        locked_topo.set_cpubind_for_thread(tid, bind_to, CPUBIND_THREAD).unwrap();
+        let after = locked_topo.get_cpubind_for_thread(tid, CPUBIND_THREAD);
+        println!("Bound main thread to {:?}", after);
+    }
 
     println!("Now accepting connections on {}", addr);
     core.run(s).unwrap();
@@ -287,7 +328,15 @@ impl Server {
             }
         });
 
-        writer.send_all(responses).and_then(|_| future::ok(())).boxed()
+        writer.send_all(responses).then(|result| {
+            match result {
+                Ok(_) => future::ok(()),
+                Err(e) => {
+                    println!("Error {}", e);
+                    future::ok(())
+                }
+            }
+        }).boxed()
     }
 }
 
@@ -399,8 +448,8 @@ impl Future for AioReader {
         };
 
         if self.stream.poll_read().is_ready() {
-            trace!("calling results");
-            match self.ctx.results(1, 100, None) {
+            trace!("eventfd is ready, calling io_getevents");
+            match self.ctx.results(0, 100, None) {
                 Ok(res) => {
                     trace!("ctx.results len {}", res.len());
                     for (op, result) in res.into_iter() {
@@ -426,9 +475,8 @@ impl Future for AioReader {
             }
         };
 
-        trace!("outstanding handles {}", self.handles.len());
-
         if self.handles.len() > 0 {
+            trace!("outstanding handles {}, stream.need_read()", self.handles.len());
             self.stream.need_read();
         }
 
@@ -476,4 +524,19 @@ impl mio::Evented for AioEventFd {
         trace!("AioEventFd.deregister");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).deregister(poll)
     }
+}
+
+fn cpuset_for_core(topology: &Topology, idx: usize) -> CpuSet {
+    let cores = (*topology).objects_with_type(&ObjectType::PU).unwrap();
+    //let cores = (*topology).objects_with_type(&ObjectType::Core).unwrap();
+    match cores.get(idx) {
+        Some(val) => val.cpuset().unwrap(),
+        None => panic!("No Core found with id {}", idx),
+    }
+}
+
+fn last_core(topology: &Topology) -> CpuSet {
+    let cores = (*topology).objects_with_type(&ObjectType::PU).unwrap();
+    //let cores = (*topology).objects_with_type(&ObjectType::Core).unwrap();
+    cores.last().unwrap().cpuset().unwrap()
 }
