@@ -4,6 +4,7 @@ extern crate rand;
 extern crate uuid;
 extern crate byteorder;
 extern crate clap;
+extern crate rayon;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -11,6 +12,8 @@ use std::path::PathBuf;
 
 use clap::{Arg, App};
 use byteorder::{BigEndian, ByteOrder};
+
+use rayon::prelude::*;
 
 fn main() {
 
@@ -68,11 +71,16 @@ fn main() {
     let mut toc_buf: Vec<u8> = Vec::with_capacity(20*num_cookies as usize);
     let mut lens = Vec::with_capacity(num_cookies as usize);
 
+
     let mut uuids = (0..num_cookies)
+        .into_par_iter()
         .map(|_| *uuid::Uuid::new_v4().as_bytes())
         .collect::<Vec<[u8; 16]>>();
+
+    println!("Sorting uuids");
     uuids.sort();
 
+    println!("Writing to in-memory buffer");
     for uuid in uuids {
         let len = rng.gen_range(min_size as usize, max_size as usize);
         lens.push(len);
@@ -86,8 +94,6 @@ fn main() {
 
     println!("Writing toc buffer to disk");
     toc_file.write_all(&toc_buf).expect("Could not write toc_buf to toc_file");
-
-
 
 
 
@@ -105,12 +111,11 @@ fn main() {
         BigEndian::write_u64(&mut encoded_len, i as u64);
         dummies.extend(encoded_len.iter());
     }
-    println!("max {}, dummies {:?}", max_len, &dummies[0..24]);
-
 
     let mut n = 0;
+    let mut written_bytes = 0;
     for chunk in lens.chunks(100_000) {
-        println!("{} of {}", n, lens.len());
+        println!("{} of {}, {} GB of {} GB", n, lens.len(), written_bytes / 1024 / 1024 / 1024, total_gb);
         n += chunk.len();
 
         let chunk_sum = chunk.iter().sum();
@@ -119,5 +124,6 @@ fn main() {
             data_buf.extend_from_slice(&dummies[0..(*len)]);
         }
         data_file.write_all(&data_buf).expect("Could not write data_buf to data_file");
+        written_bytes += chunk_sum;
     }
 }

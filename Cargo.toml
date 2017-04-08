@@ -23,7 +23,6 @@ rayon = "0.6.0"
 memmap = "0.5.0"
 log = "0.3"
 env_logger = "0.3"
-fnv = "1.0.3"
 
 [[bin]]
 name = "run"

@@ -16,13 +16,10 @@ extern crate bytes;
 extern crate clap;
 extern crate rayon;
 extern crate memmap;
-extern crate fnv;
 
 use std::io;
 use std::str;
-use std::cmp;
 use std::fs::metadata;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::ops::Drop;
 use std::sync::Arc;
@@ -50,8 +47,6 @@ use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian, ByteOrder};
 use rayon::prelude::*;
 
-use fnv::FnvHashMap;
-
 use clap::{App, Arg};
 
 
@@ -69,10 +64,15 @@ fn main() {
              .takes_value(true)
              .required(true)
              .help("Directory to write datafiles"))
+        .arg(Arg::with_name("num-threads")
+             .long("num-threads")
+             .takes_value(true)
+             .help("Number of AIO threads"))
         .get_matches();
 
 
     let path = matches.value_of("path").unwrap();
+    let num_threads = matches.value_of("num-threads").unwrap_or("4").parse::<usize>().expect("Could not parse 'num-threads'");
 
     let mut toc_path = PathBuf::from(path);
     let mut data_path = PathBuf::from(path);
@@ -84,38 +84,39 @@ fn main() {
     //
     // Read Table of Contents
     //
-    println!("Reading Table of Contents file at {:?}", toc_path);
+    println!("Parsing Table of Contents file at {:?}", toc_path);
     let meta = metadata(toc_path.clone()).expect("Could not read metadata for toc file");
     let toc_size: usize = meta.len() as usize;
-
+    let num_entries = (toc_size / 20) as u64;
 
     let toc_mmap = memmap::Mmap::open_path(toc_path, memmap::Protection::Read).expect("Could not read toc file");
     let toc_buf: &[u8] = unsafe { toc_mmap.as_slice() };
 
+    let offsets: Vec<usize> = (0..num_entries).map(|i| (i*20) as usize).collect();
+    let toc_uuids: Vec<Vec<u8>> = offsets
+        .par_iter()
+        .cloned()
+        .map(|offset| toc_buf[offset .. offset+16].to_vec())
+        .collect();
+    let toc_uuids = Arc::new(toc_uuids);
 
-    let num_entries = (toc_size / 20) as u64;
-    let toc_entries = (0..num_entries)
-        .into_par_iter()
-        .map(|i| {
-            let offset = (i*20) as usize;
-            let uuid = toc_buf[offset .. offset+16].to_vec();
-            let len = BigEndian::read_u32(&toc_buf[offset+16 .. offset+20]) as usize;
-            (uuid, len)
-        })
-        .collect::<Vec<(Vec<u8>, usize)>>();
+    let toc_lens: Vec<usize> = offsets
+        .par_iter()
+        .cloned()
+        .map(|offset| BigEndian::read_u32(&toc_buf[offset+16 .. offset+20]) as usize)
+        .collect();
+    let toc_lens = Arc::new(toc_lens);
 
-    println!("Read toc. Creating HashMap");
-    let mut toc: FnvHashMap<Vec<u8>, (usize, usize)> = FnvHashMap::with_capacity_and_hasher(num_entries as usize, Default::default());
+    let mut toc_offsets = Vec::with_capacity(num_entries as usize);
     let mut offset = 0;
-    let mut max_len = 0;
-    for (uuid, len) in toc_entries {
-        toc.insert(uuid, (offset, len));
-        offset += len;
-        max_len = cmp::max(max_len, len);
+    for i in 0..num_entries {
+        toc_offsets.push(offset);
+        offset += toc_lens[i as usize];
     }
-    let toc = Arc::new(toc);
+    let toc_offsets = Arc::new(toc_offsets);
 
-    println!("Toc has {} entries. Max length {}", toc.len(), max_len);
+    let max_len = toc_lens.iter().cloned().max().unwrap();
+    println!("ToC has {} entries. Max length {}", toc_uuids.len(), max_len);
 
 
 
@@ -123,19 +124,20 @@ fn main() {
     // Create TCP listener
     //
 
-    println!("Creating tcp event loop");
+    println!("Creating event loop for accepting TCP connections and AIO responses");
     let addr = "0.0.0.0:12345".parse().unwrap();
-
     let mut core = Core::new().unwrap();
     let handle = core.handle();
+    let listener = TcpListener::bind(&addr, &handle).unwrap();
 
     let datafile = DirectFile::open(data_path.clone(), Mode::Open, FileAccess::Read, 4096)
         .expect("Could not open data file with O_DIRECT");
-    let session = Arc::new(AioSession::new(handle.clone(), datafile).unwrap());
+    let session = Arc::new(AioSession::new(handle, datafile).unwrap());
     let session_handle = session.handle();
-    let listener = TcpListener::bind(&addr, &handle).unwrap();
 
-    let (pool, join) = TokioPool::new(1).unwrap();
+
+    println!("Creating a pool of event loops for handling requests, using {} threads", num_threads);
+    let (pool, _) = TokioPool::new(num_threads).unwrap();
     let pool = Arc::new(pool);
 
 
@@ -146,7 +148,9 @@ fn main() {
 
         let server = Server {
             session: session_handle.clone(),
-            toc: toc.clone()
+            toc_uuids: toc_uuids.clone(),
+            toc_offsets: toc_offsets.clone(),
+            toc_lens: toc_lens.clone(),
         };
 
         println!("Got new connection from {}", addr);
@@ -155,14 +159,14 @@ fn main() {
             .serve(socket, buf)
             .map(|_|  println!("Connection closed"))
             .map_err(|_| println!("Serve error"));
-        pool.next_worker().spawn(move |h| result);
+        pool.next_worker().spawn(move |_| result);
 
         Ok(())
     });
 
+    println!("Now accepting connections on {}", addr);
     core.run(s).unwrap();
 }
-
 
 
 
@@ -238,7 +242,9 @@ impl Encoder for Protocol {
 
 struct Server {
     session: Arc<SessionHandle>,
-    toc: Arc<FnvHashMap<Vec<u8>, (usize, usize)>>,
+    toc_uuids: Arc<Vec<Vec<u8>>>,
+    toc_offsets: Arc<Vec<usize>>,
+    toc_lens: Arc<Vec<usize>>,
 }
 
 impl Server {
@@ -250,8 +256,11 @@ impl Server {
         let responses = reader.and_then(move |req| {
             let mybuf = buf.clone().into_inner();
 
-            match self.toc.clone().get(req.uuid.as_slice()) {
-                Some(&(offset, len)) => {
+            match self.toc_uuids.binary_search(&req.uuid) {
+                Ok(index) => {
+                    let offset = self.toc_offsets[index];
+                    let len = self.toc_lens[index];
+
                     let aligned_offset = offset - (offset % 512);
                     let aligned_len = len + 512 - (len % 512);
 
@@ -267,7 +276,7 @@ impl Server {
                         future::ok(res)
                     }).boxed()
                 },
-                None => {
+                Err(_) => {
                     let res = Response {
                         id: req.id,
                         len: 0,
