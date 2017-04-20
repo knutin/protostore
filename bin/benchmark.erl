@@ -1,12 +1,20 @@
 #!/usr/bin/env escript
-% bin/benchmark.erl 127.0.0.1 12345 2 2 /mnt/data/protostore.toc
-% bin/benchmark.erl 172.18.230.186 12345 2 2 /mnt/data/protostore.toc
+%% Localhost
+%% bin/benchmark.erl protostore 127.0.0.1 12345 2 2 /mnt/data/protostore.toc
+%% bin/benchmark.erl redis 127.0.0.1 6379 2 2 /mnt/data/protostore.toc
+%%
+%% i3
+%% bin/benchmark.erl protostore 172.18.230.186 12345 2 2 /mnt/data/protostore.toc
+%%
+%% r3
+%% bin/benchmark.erl redis 172.18.229.112 6379 2 2 redis.toc
 
 -mode(compile).
 
 -include_lib("kernel/include/file.hrl").
 
-main([Host, PortString, NumProcsString, RuntimeString, TocFile]) ->
+main([ServerTypeString, Host, PortString, NumProcsString, RuntimeString, TocFile]) ->
+    ServerType = list_to_atom(ServerTypeString),
     Port = list_to_integer(PortString),
     NumProcs = list_to_integer(NumProcsString),
     Runtime = list_to_integer(RuntimeString),
@@ -22,7 +30,7 @@ main([Host, PortString, NumProcsString, RuntimeString, TocFile]) ->
                                         {ok, S} -> S;
                                         _ -> throw(could_not_connect)
                                     end,
-                             spawn_link(fun () ->  hammer(Sock, Toc) end)
+                             spawn_link(fun () -> hammer(ServerType, Sock, Toc) end)
                      end,
                      lists:seq(1, NumProcs)),
 
@@ -69,18 +77,18 @@ recv_all(T, L, [Pid | Pids]) ->
     end.
 
 
-hammer(Sock, Toc) ->
+hammer(ServerType, Sock, Toc) ->
     Position = trunc(rand:uniform() * (byte_size(Toc) div 20)),
     MaxPos = byte_size(Toc) div 20,
     ReqId = 0,
 
     receive hammertime -> ok end,
     io:format("Process ~p: It's hammertime!~n", [self()]),
-    hammer(Sock, ReqId, Toc, Position, MaxPos, [], []).
+    hammer(ServerType, Sock, ReqId, Toc, Position, MaxPos, [], []).
 
-hammer(Sock, ReqId, Toc, MaxPos, MaxPos, Timings, Lens) ->
-    hammer(Sock, ReqId, Toc, 0, MaxPos, Timings, Lens);
-hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
+hammer(ServerType, Sock, ReqId, Toc, MaxPos, MaxPos, Timings, Lens) ->
+    hammer(ServerType, Sock, ReqId, Toc, 0, MaxPos, Timings, Lens);
+hammer(protostore, Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
     Uuid = binary:part(Toc, Pos*20, 16),
 
     %% Time the full roundtrip, including sending the request and
@@ -109,16 +117,62 @@ hammer(Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
     after 0 ->
             case Result of
                 {ok, Len} ->
-                    hammer(Sock, ReqId+1, Toc, Pos+1, MaxPos, [ElapsedUs | Timings], [Len | Lens]);
+                    hammer(protostore, Sock, ReqId+1, Toc, Pos+1, MaxPos, [ElapsedUs | Timings], [Len | Lens]);
+                Error ->
+                    throw({hammer_error, ReqId, Error})
+            end
+    end;
+
+hammer(redis, Sock, ReqId, Toc, Pos, MaxPos, Timings, Lens) ->
+    Uuid = binary:part(Toc, Pos*20, 16),
+
+    %% Time the full roundtrip, including sending the request and
+    %% receiveng the full response.
+    {ElapsedUs, Result} = timer:tc(
+                            fun () ->
+                                    Req = [<<"*2\r\n">>, to_bulk(<<"GET">>), to_bulk(Uuid)],
+                                    ok = gen_tcp:send(Sock, Req),
+
+                                    case gen_tcp:recv(Sock, 0, 5000) of
+                                        {ok, <<"$-1\r\n">>} ->
+                                            throw(key_not_found);
+
+                                        {ok, <<$$, LenString:4/binary, "\r\n", Body/binary>>} ->
+                                            Len = list_to_integer(binary_to_list(LenString)),
+                                            case Len =:= byte_size(Body)-2 of
+                                                true ->
+                                                    ok;
+                                                false ->
+                                                    {ok, _} = gen_tcp:recv(Sock, Len-byte_size(Body)+2, 5000)
+                                            end,
+
+                                            {ok, Len};
+                                        {ok, Other} ->
+                                            io:format("Got unexpected response: ~p~n", [Other]),
+                                            throw(stop);
+                                        {error, timeout} ->
+                                            io:format("Process ~p: timeout waiting for req id ~p, uuid ~p~n", [self(), ReqId, Uuid]),
+                                            throw(timeout);
+                                        Error ->
+                                            Error
+                                    end
+                            end),
+    receive
+        {halt, Pid} ->
+            ok = gen_tcp:close(Sock),
+            Pid ! {self(), results, Timings, Lens}
+    after 0 ->
+            case Result of
+                {ok, Len} ->
+                    hammer(redis, Sock, ReqId+1, Toc, Pos+1, MaxPos, [ElapsedUs | Timings], [Len | Lens]);
                 Error ->
                     throw({hammer_error, ReqId, Error})
             end
     end.
 
 
-
-
-
+to_bulk(B) when is_binary(B) ->
+    [<<$$>>, integer_to_list(iolist_size(B)), <<"\r\n">>, B, <<"\r\n">>].
 
 
 read_toc(Path) ->
