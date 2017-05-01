@@ -1,5 +1,4 @@
 use std::io;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use std::slice::from_raw_parts;
@@ -64,7 +63,7 @@ impl TableOfContents {
     pub fn offset_and_len(&self, uuid: &[u8; 16]) -> Option<(u64, u16)> {
         match self.uuids.binary_search(uuid) {
             Ok(index) => Some((self.offsets[index], self.lens[index])),
-            Err(index) => None
+            Err(_) => None
         }
     }
 

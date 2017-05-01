@@ -2,26 +2,23 @@ use futures::sync::mpsc::{channel};
 use std::thread::{self, JoinHandle};
 
 use std::io;
-use std::os::unix::io::RawFd;
-use std::sync::Arc;
 
 use mio;
 
 use libc;
 
-use futures::{future, Future, BoxFuture, Async, Poll};
-use futures::{sink, Sink};
-use futures::{oneshot, Oneshot, Complete};
-use futures::stream::{self, Stream, Fuse};
+use futures::{Future, Async, Poll};
+use futures::{oneshot, Complete};
+use futures::stream::{Stream, Fuse};
 use futures::sync::mpsc;
 
 use tokio_core::reactor::{Core, PollEvented};
 
-use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
+use bytes::BytesMut;
 use eventfd::EventFD;
 use std::os::unix::io::AsRawFd;
 use libaio::raw::{Iocontext, IoOp};
-use libaio::directio::{DirectFile, Mode, FileAccess};
+use libaio::directio::DirectFile;
 
 use slab::Slab;
 
@@ -31,9 +28,6 @@ pub enum Message {
     Ping(Complete<io::Result<u8>>)
 }
 
-enum Request {
-    PRead(Oneshot<io::Result<(BytesMut, Option<io::Error>)>>)
-}
 
 
 #[derive(Debug)]
@@ -64,7 +58,7 @@ impl Session {
 
             // Return the pthread id so the main thread can bind this
             // thread to a specific core
-            tid_tx.complete(unsafe { libc::pthread_self() });
+            tid_tx.send(unsafe { libc::pthread_self() }).unwrap();
 
             let mut ctx = match Iocontext::<usize, BytesMut, BytesMut>::new(max_queue_depth) {
                 Ok(ctx) => ctx,
@@ -101,14 +95,9 @@ impl Session {
         Ok(Session { inner: tx, thread: t, pthread: tid })
     }
 
-    fn handle(&self) -> SessionHandle {
-        SessionHandle { inner: self.inner.clone() }
-    }
-
     pub fn thread_id(&self) -> libc::pthread_t {
         self.pthread
     }
-
 }
 
 

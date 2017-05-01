@@ -29,24 +29,19 @@ use std::thread;
 use std::collections::HashMap;
 
 use futures::{future, Future, BoxFuture, Sink};
-use futures::stream::{self, Stream, Fuse};
-use futures::sync::mpsc::{channel, unbounded, UnboundedSender, UnboundedReceiver};
+use futures::stream::Stream;
 
-use eventfd::EventFD;
+
 use std::os::unix::io::AsRawFd;
-use libaio::raw::{Iocontext, IoOp};
 use libaio::directio::{DirectFile, Mode, FileAccess};
 
-use slab::Slab;
-
-use tokio_core::reactor::{Core, Handle, Remote, PollEvented};
+use tokio_core::reactor::{Core, Remote};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
 use tokio_io::codec::{Decoder, Encoder};
 
 use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
-use byteorder::{BigEndian, ByteOrder};
-use rayon::prelude::*;
+use byteorder::{BigEndian};
 
 use hwloc::{Topology, ObjectType, CPUBIND_THREAD, CpuSet};
 
@@ -158,7 +153,7 @@ fn main() {
             //pu_index += 1;
 
             let mut core = Core::new().unwrap();
-            remote_tx.send(core.remote());
+            remote_tx.send(core.remote()).unwrap();
 
             loop {
                 core.turn(None)
@@ -271,6 +266,9 @@ impl Encoder for Protocol {
 }
 
 
+// Handle a single client. Receive request for an uuid, look up offset
+// and length in table of contents, read the value from disk, send
+// response to client.
 fn handle_client(toc: Arc<TableOfContents>,
                  file: DirectFile,
                  socket: TcpStream,
@@ -287,22 +285,22 @@ fn handle_client(toc: Arc<TableOfContents>,
 
     let framed = socket.framed(Protocol);
     let (writer, reader) = framed.split();
-    let reads = reader.and_then(move |req| {
 
+    let responses = reader.and_then(move |req| {
         let mybuf = buf.clone(); // BytesMut.clone()
         let aio_channel = aio_channel.clone();
 
+        // Poor-man-clone of DirectFile
         let fd = file.as_raw_fd();
         let file = DirectFile { fd: FD::new(fd), alignment: file.alignment};
-
 
         if let Some((offset, len)) = toc.offset_and_len(&req.uuid) {
             let aligned_offset = offset - (offset % 512);
             let aligned_len = len + 512 - (len % 512);
 
             let (tx, rx) = futures::oneshot();
+            trace!("creating msg");
             aio_channel.send(aio::Message::PRead(file, 0, 512, mybuf, tx)).wait();
-
             rx.then(move |res| {
                 match res {
                     Ok(Ok((buf, err))) => {
@@ -332,13 +330,27 @@ fn handle_client(toc: Arc<TableOfContents>,
                 len: 0,
                 body: Bytes::new()
             };
+
             future::ok(res).boxed()
+
+            //Err(io::Error::new(io::ErrorKind::Other, "Uuid not found"))
         }
     });
 
 
+            // aio_channel.send(aio::Message::PRead(file, 0, 512, mybuf, tx)).boxed()
+
+
+    //let responses = aio_channel.clone().send_all(reads.map_err(|_| ()));
+
+    //let responses = reads
+    //    .map(|msg| aio_channel.clone().send(msg));
+
+
+
+
     //let responses = reads.map(|res| future::ok(res)).buffer_unordered(1000);
-    let responses = reads;
+    //let responses = reads;
 
     writer.send_all(responses).then(move |result| {
         match result {
