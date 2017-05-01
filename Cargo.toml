@@ -4,26 +4,32 @@ version = "0.1.0"
 authors = ["Knut Nesheim <knutin@gmail.com>"]
 
 [dependencies]
-futures = "0.1.11"
+futures = "0.1.13"
 tokio-core = "0.1.6"
 tokio-proto = "0.1.1"
-tokio-io = "0.1.0"
+tokio-io = "0.1.1"
 libaio = { git = "https://github.com/knutin/libaio-rust.git", branch = "update" }
 #libaio = { git = "file:///home/knutin/git/libaio-rust", branch = "update" }
-mio = "0.6.5"
+mio = "0.6.7"
 slab = "0.3.0"
 eventfd = { git = "https://github.com/knutin/eventfd-rust.git" }
 byteorder = "1.0.0"
 uuid = {version = "0.3.1", features = ["v4"]}
 rand = "0.3"
-clap = "2.20.5"
-bytes = "0.4.1"
+clap = "2.23.3"
+bytes = "0.4.3"
 rayon = "0.7.0"
 memmap = "0.5.0"
 log = "0.3"
 env_logger = "0.3"
 hwloc = "0.4.0"
-libc = "0.2.21"
+libc = "0.2.22"
+
+[dev-dependencies]
+tempdir = "*"
+
+[profile.release]
+debug = true
 
 [[bin]]
 name = "run"

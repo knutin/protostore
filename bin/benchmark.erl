@@ -13,7 +13,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
-main([ServerTypeString, Host, PortString, NumProcsString, RuntimeString, MaxInflightString, TocFile]) ->
+main([ServerTypeString, Host, PortString, NumProcsString, RuntimeString, MaxInflightString, DataDir]) ->
     ServerType = list_to_atom(ServerTypeString),
     Port = list_to_integer(PortString),
     NumProcs = list_to_integer(NumProcsString),
@@ -21,8 +21,8 @@ main([ServerTypeString, Host, PortString, NumProcsString, RuntimeString, MaxInfl
     MaxInflight = list_to_integer(MaxInflightString),
 
     %% Read uuids so we know which keys to fetch.
-    Toc = read_toc(TocFile),
-    io:format("Read toc with ~p entries~n", [byte_size(Toc) div 20]),
+    Toc = read_toc(DataDir),
+    %%io:format("Read toc with ~p entries~n", [byte_size(element(1, Toc)) div 20]),
 
 
     io:format("Starting ~p clients~n", [NumProcs]),
@@ -80,8 +80,9 @@ recv_all(T, L, [Pid | Pids]) ->
 
 
 hammer(ServerType, Sock, MaxInflight, Toc) ->
-    Position = trunc(rand:uniform() * (byte_size(Toc) div 20)),
-    MaxPos = byte_size(Toc) div 20,
+    {Uuids, _} = Toc,
+    Position = trunc(rand:uniform() * (byte_size(Uuids) div 16)),
+    MaxPos = byte_size(Uuids) div 16,
     ReqId = 0,
     InflightReqs = #{},
 
@@ -104,24 +105,27 @@ hammer(protostore, Sock, ReqId, InflightReqs, MaxInflight, Toc, Pos, MaxPos, Tim
     after 0 ->
             case maps:size(InflightReqs) =:= MaxInflight of
                 true ->
-                    {NewInflightReqs, NewTimings, NewLens} = recv(Sock, InflightReqs, Timings, Lens),
-                    hammer(protostore, Sock, ReqId, NewInflightReqs, MaxInflight, Toc, Pos+1, MaxPos, NewTimings, NewLens);
+                    {NewInflightReqs, NewTimings, NewLens} = block_recv(Sock, InflightReqs, Timings, Lens),
+                    hammer(protostore, Sock, ReqId, NewInflightReqs, MaxInflight, Toc, Pos, MaxPos, NewTimings, NewLens);
 
                 false ->
-                    Uuid = binary:part(Toc, Pos*20, 16),
+                    {Uuids, _ValueLens} = Toc,
+                    Uuid = binary:part(Uuids, Pos*16, 16),
                     Now = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
 
                     ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),
-                    NewInflightReqs = maps:put(ReqId, Now, InflightReqs),
+                    InflightReqs1 = maps:put(ReqId, Now, InflightReqs),
 
-                    hammer(protostore, Sock, ReqId+1, NewInflightReqs, MaxInflight, Toc, Pos+1, MaxPos, Timings, Lens)
+                    {InflightReqs2, NewTimings, NewLens} = recv(Sock, InflightReqs1, Timings, Lens),
+                    NewPos = random:uniform(MaxPos),
+                    hammer(protostore, Sock, ReqId+1, InflightReqs2, MaxInflight, Toc, NewPos, MaxPos, NewTimings, NewLens)
             end
     end;
 
 
 
 hammer(redis, Sock, ReqId, InflightReqs, MaxInflightReqs, Toc, Pos, MaxPos, Timings, Lens) ->
-    Uuid = binary:part(Toc, Pos*20, 16),
+    Uuid = binary:part(Toc, Pos*16, 16),
 
     %% Time the full roundtrip, including sending the request and
     %% receiveng the full response.
@@ -169,44 +173,54 @@ hammer(redis, Sock, ReqId, InflightReqs, MaxInflightReqs, Toc, Pos, MaxPos, Timi
 
 
 
-%% Receive as many responses are available without blocking
-recv(Sock, Inflight, Timings, Lens) ->
-    recv(Sock, <<>>, Inflight, Timings, Lens).
 
 
-recv(Sock, <<>>, Inflight, Timings, Lens) ->
-    receive
-        {tcp, Sock, Data} ->
-            parse(Sock, Data, Inflight, Timings, Lens)
-    after 0 ->
-            {Inflight, Timings, Lens}
-    end;
+block_recv(Sock, Inflight, Timings, Lens) ->
+    block_recv(Sock, <<>>, Inflight, Timings, Lens).
 
-recv(Sock, Partial, Inflight, Timings, Lens) ->
+block_recv(Sock, Partial, Inflight, Timings, Lens) ->
     receive
         {tcp, Sock, Data} ->
             parse(Sock, <<Partial/binary, Data/binary>>, Inflight, Timings, Lens)
     end.
 
+%% Receive as many responses are available without blocking
+recv(Sock, Inflight, Timings, Lens) ->
+    recv(Sock, <<>>, Inflight, Timings, Lens).
+
+recv(Sock, Partial, Inflight, Timings, Lens) ->
+    receive
+        {tcp, Sock, Data} ->
+            parse(Sock, <<Partial/binary, Data/binary>>, Inflight, Timings, Lens)
+    after 0 ->
+            {Inflight, Timings, Lens}
+    end.
+
+
 parse(Sock, Data, Inflight, Timings, Lens) ->
     case Data of
+        <<>> ->
+            {Inflight, Timings, Lens};
+
         <<_:32/unsigned-integer,  0:32/unsigned-integer, _/binary>> ->
+            io:format("bad data: ~p~n", [Data]),
             throw(bad_response);
 
         <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer, Body/binary>> ->
+            %%io:format("req id ~p, len ~p, body ~p~n", [ReqId, Len, byte_size(Body)]),
             case byte_size(Body) >= Len of
                 true ->
                     <<_ResponseBody:Len/binary, Rest/binary>> = Body,
-
                     End = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
                     {Start, NewInflight} = maps:take(ReqId, Inflight),
                     ElapsedUs = End - Start,
                     parse(Sock, Rest, NewInflight, [ElapsedUs | Timings], [Len | Lens]);
                 false ->
-                    recv(Sock, Data, Inflight, Timings, Lens)
+                    block_recv(Sock, Data, Inflight, Timings, Lens)
             end;
+
         _ ->
-            recv(Sock, Data, Inflight, Timings, Lens)
+            block_recv(Sock, Data, Inflight, Timings, Lens)
     end.
 
 
@@ -216,17 +230,24 @@ to_bulk(B) when is_binary(B) ->
     [<<$$>>, integer_to_list(iolist_size(B)), <<"\r\n">>, B, <<"\r\n">>].
 
 
-read_toc(Path) ->
-    io:format("Reading toc file from ~p~n", [Path]),
+read_toc(DataDir) ->
+    io:format("Reading Table of Contents from ~p~n", [DataDir]),
 
-    {ok, FileInfo} = file:read_file_info(Path),
-    TotalSize = FileInfo#file_info.size,
-    io:format("Toc is ~p bytes, ~p entries~n", [TotalSize, TotalSize div 20]),
+    UuidPath = filename:join([DataDir, "protostore.toc.uuids"]),
+    LensPath = filename:join([DataDir, "protostore.toc.lengths"]),
 
-    {ok, F} = file:open(Path, [read, raw, binary]),
+    {ok, UuidFileInfo} = file:read_file_info(UuidPath),
+    {ok, LensFileInfo} = file:read_file_info(LensPath),
+    UuidTotalSize = UuidFileInfo#file_info.size,
+    LensTotalSize = LensFileInfo#file_info.size,
+    io:format("Uuid table of contents is ~p bytes, ~p entries~n", [UuidTotalSize, UuidTotalSize div 16]),
 
-    Toc = read_chunk(F, min(10000000*20, TotalSize), TotalSize, 0, []),
-    iolist_to_binary(Toc).
+    {ok, UuidF} = file:open(UuidPath, [read, raw, binary]),
+    {ok, LensF} = file:open(LensPath, [read, raw, binary]),
+
+    Uuids = read_chunk(UuidF, min(10000000*16, UuidTotalSize), UuidTotalSize, 0, []),
+    Lens = read_chunk(LensF, min(10000000*8, LensTotalSize), LensTotalSize, 0, []),
+    {iolist_to_binary(Uuids), iolist_to_binary(Lens)}.
 
 
 read_chunk(F, ChunkSize, TotalSize, Position, Toc) ->
