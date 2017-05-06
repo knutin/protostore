@@ -94,7 +94,7 @@ fn main() {
     let num_aio_threads = matches.value_of("num-aio-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-aio-threads'");
     let num_tcp_threads = matches.value_of("num-tcp-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-tcp-threads'");
     let max_io_depth = matches.value_of("max-io-depth").unwrap_or("64").parse::<usize>().expect("Could not parse 'max-io-depth'");
-    let _short_circuit_reads = matches.is_present("short-circuit-reads");
+    let short_circuit_reads = matches.is_present("short-circuit-reads");
 
 
     let datafile_path = data_dir.join("protostore.data".to_owned());
@@ -202,7 +202,7 @@ fn main() {
         let ref tcp_remote = tcp_handles[tcp_idx];
         let ref aio_session = aio_sessions[aio_idx];
 
-        let result = handle_client(toc.clone(), datafile, socket, max_value_len, aio_session)
+        let result = handle_client(toc.clone(), datafile, socket, max_value_len, aio_session, short_circuit_reads)
             .map(move |_| {
                 info!("Connection to {} closed", addr);
                 ()
@@ -231,7 +231,8 @@ fn handle_client(toc: Arc<TableOfContents>,
                  file: DirectFile,
                  socket: TcpStream,
                  max_value_len: usize,
-                 aio: &aio::Session) -> BoxFuture<(), io::Error> {
+                 aio: &aio::Session,
+                 short_circuit_reads: bool) -> BoxFuture<(), io::Error> {
 
     // Create a buffer to hold values read from disk or the client
     let aligned_max_len = cmp::max(512, max_value_len + (max_value_len % 512));
@@ -263,24 +264,28 @@ fn handle_client(toc: Arc<TableOfContents>,
                     let padded = pad_left + len as u64;
                     let aligned_len = cmp::max(512, padded + 512 - (padded as u64 % 512));
 
-                    let (tx, rx) = futures::oneshot();
-                    aio_channel.send(aio::Message::PRead(file, aligned_offset as usize, aligned_len as usize, mybuf, tx)).wait();
-                    rx.then(move |res| {
-                        match res {
-                            Ok(Ok((buf, _))) => {
-                                let body = buf.freeze().slice(pad_left as usize, pad_left as usize + len as usize);
-                                let res = Response { id: req.id, body: body };
-                                future::ok(res)
-                            },
-                            Ok(Err(e)) => {
-                                panic!("aio failed: {:?}", e)
-                            },
-                            Err(e) => {
-                                panic!("aio failed: {:?}", e)
+                    if !short_circuit_reads {
+                        let (tx, rx) = futures::oneshot();
+                        aio_channel.send(aio::Message::PRead(file, aligned_offset as usize, aligned_len as usize, mybuf, tx)).wait();
+                        rx.then(move |res| {
+                            match res {
+                                Ok(Ok((buf, _))) => {
+                                    let body = buf.freeze().slice(pad_left as usize, pad_left as usize + len as usize);
+                                    let res = Response { id: req.id, body: body };
+                                    future::ok(res)
+                                },
+                                Ok(Err(e)) => {
+                                    panic!("aio failed: {:?}", e)
+                                },
+                                Err(e) => {
+                                    panic!("aio failed: {:?}", e)
+                                }
                             }
-                        }
-                    }).boxed()
-
+                        }).boxed()
+                    } else {
+                        let res = Response { id: req.id, body: Bytes::from(vec![0,1,2,3]) };
+                        future::ok(res).boxed()
+                    }
                 } else {
                     let res = Response { id: req.id, body: Bytes::new() };
                     future::ok(res).boxed()
