@@ -7,9 +7,9 @@
 
 -include_lib("kernel/include/file.hrl").
 
-main([Host, PortString, NumWritesPerSecondString, RuntimeString, DataDir]) ->
+main([Host, PortString, NumProcessesString, RuntimeString, DataDir]) ->
     Port = list_to_integer(PortString),
-    NumWritesPerSecond = list_to_integer(NumWritesPerSecondString),
+    NumProcesses = list_to_integer(NumProcessesString),
     Runtime = list_to_integer(RuntimeString),
 
     Toc = read_toc(DataDir),
@@ -17,37 +17,32 @@ main([Host, PortString, NumWritesPerSecondString, RuntimeString, DataDir]) ->
     DummyData = iolist_to_binary([<<(rand:uniform(255)-1):8/integer>> || _ <- lists:seq(0, max_len(Toc))]),
     %%DummyData = iolist_to_binary([<<I:8/unsigned-integer>> || I <- lists:seq(0, max_len(Toc))]),
 
-
-    Writer = spawn_link(fun () ->
-                                Sock = case gen_tcp:connect(Host, Port, [binary, {active, false}]) of
-                                           {ok, S} -> S;
-                                           _ -> throw(could_not_connect)
-                                       end,
-                                hammer(Sock, NumWritesPerSecond, Toc, DummyData) end),
-
+    Pids = lists:map(fun (_) ->
+                             spawn_link(fun () ->
+                                                Sock = case gen_tcp:connect(Host, Port, [binary, {active, false}]) of
+                                                           {ok, S} -> S;
+                                                           _ -> throw(could_not_connect)
+                                                       end,
+                                                hammer(Sock, Toc, DummyData) end)
+                     end,
+                     lists:seq(1, NumProcesses)),
     io:format("Running for ~p seconds~n", [Runtime]),
-    Writer ! hammertime,
+    [Pid ! hammertime || Pid <- Pids],
     timer:sleep(Runtime * 1000),
 
-    Writer ! {halt, self()},
+    [Pid ! {halt, self()} || Pid <- Pids],
     io:format("============================~n"),
 
-    {Timings, Lens} = receive
-                          {Writer, results, Ts, Ls} ->
-                              {Ts, Ls}
-                      after 1000 ->
-                              throw(writer_halt_timeout)
-                      end,
+    {Timings, Lens} = recv_all(Pids),
 
+    BytesTransferred = lists:sum(lists:flatten(Lens)),
 
-    BytesTransferred = lists:sum(Lens),
-
-    Stats = bear:get_statistics(Timings),
+    Stats = bear:get_statistics(lists:flatten(Timings)),
     N = proplists:get_value(n, Stats),
     Percentiles = proplists:get_value(percentile, Stats),
     io:format("Runtime: ~p s~n", [Runtime]),
     io:format("Total requests: ~p~n", [N]),
-    io:format("Avg rps: ~.2f~n", [N / Runtime]),
+    io:format("Avg writes per second: ~.2f~n", [N / Runtime]),
     io:format("Bytes transferred: ~.2f MB~n", [BytesTransferred / 1024 / 1024]),
     io:format("Bytes per second: ~.2f MB~n", [(BytesTransferred / 1024 / 1024) / Runtime]),
 
@@ -58,20 +53,34 @@ main([Host, PortString, NumWritesPerSecondString, RuntimeString, DataDir]) ->
 
 
 
-hammer(Sock, NumWritesPerSecond, Toc, DummyData) ->
+recv_all(Pids) ->
+    recv_all([], [], Pids).
+
+recv_all(T, L, []) ->
+    {T, L};
+recv_all(T, L, [Pid | Pids]) ->
+    receive
+        {Pid, results, Timings, Lens} ->
+            recv_all([Timings | T], [Lens | L], Pids)
+    after 10000 ->
+            io:format("Could not receive timings from ~p~n", [Pid]),
+            {T, L}
+    end.
+
+
+hammer(Sock, Toc, DummyData) ->
     {Uuids, _} = Toc,
     Position = trunc(rand:uniform() * (byte_size(Uuids) div 16)),
     MaxPos = byte_size(Uuids) div 16,
 
-    WriteSleep = 1000 / NumWritesPerSecond,
     ReqId = 0,
 
     receive hammertime -> ok end,
     io:format("Process ~p: It's hammertime!~n", [self()]),
-    hammer(Sock, ReqId, WriteSleep, Toc, Position, MaxPos, DummyData, [], []).
+    hammer(Sock, ReqId, Toc, Position, MaxPos, DummyData, [], []).
 
 
-hammer(Sock, ReqId, WriteSleep, Toc, Pos, MaxPos, DummyData, Timings, Lens) ->
+hammer(Sock, ReqId, Toc, Pos, MaxPos, DummyData, Timings, Lens) ->
     receive
         {halt, Pid} ->
             Pid ! {self(), results, Timings, Lens}
@@ -85,7 +94,6 @@ hammer(Sock, ReqId, WriteSleep, Toc, Pos, MaxPos, DummyData, Timings, Lens) ->
             Req = <<Len:32/unsigned-integer, "W", Uuid/binary, ReqId:32/unsigned-integer, Body/binary>>,
             Start = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
             ok = gen_tcp:send(Sock, Req),
-
             case gen_tcp:recv(Sock, 0, 1000) of
                 {ok, <<ReqId:32/unsigned-integer, 0:16/unsigned-integer>>} ->
                     End = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
@@ -111,7 +119,7 @@ hammer(Sock, ReqId, WriteSleep, Toc, Pos, MaxPos, DummyData, Timings, Lens) ->
 
                     NewPos = rand:uniform(MaxPos)-1,
                     %%timer:sleep(1000),
-                    hammer(Sock, ReqId+1, WriteSleep, Toc, NewPos, MaxPos, DummyData, [ElapsedUs | Timings], [BodyLen | Lens]);
+                    hammer(Sock, ReqId+1, Toc, NewPos, MaxPos, DummyData, [ElapsedUs | Timings], [BodyLen | Lens]);
                 Any ->
                     io:format("Got unexpected response ~p~n", [Any]),
                     throw(unexpected_response)

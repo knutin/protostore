@@ -359,21 +359,6 @@ fn handle_client(toc: Arc<TableOfContents>,
         }
     });
 
-
-            // aio_channel.send(aio::Message::PRead(file, 0, 512, mybuf, tx)).boxed()
-
-
-    //let responses = aio_channel.clone().send_all(reads.map_err(|_| ()));
-
-    //let responses = reads
-    //    .map(|msg| aio_channel.clone().send(msg));
-
-
-
-
-    //let responses = reads.map(|res| future::ok(res)).buffer_unordered(1000);
-    //let responses = reads;
-
     writer.send_all(responses).then(move |result| {
         match result {
             Ok(_) => {
