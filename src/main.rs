@@ -24,9 +24,7 @@ use std::str;
 use std::path::Path;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, Duration};
 use std::thread;
-use std::collections::HashMap;
 use std::cmp;
 
 use futures::{future, Future, BoxFuture, Sink};
@@ -40,9 +38,7 @@ use tokio_core::reactor::{Core, Remote};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
 
-
-use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
-use byteorder::{BigEndian};
+use bytes::{Buf, BytesMut, Bytes, IntoBuf};
 
 use hwloc::{Topology, ObjectType, CPUBIND_THREAD, CpuSet};
 
@@ -51,7 +47,7 @@ use clap::{App, Arg};
 use libaio::FD;
 
 use toc::TableOfContents;
-use protocol::{Protocol, Request, RequestType, Response};
+use protocol::{Protocol, RequestType, Response};
 
 
 
@@ -98,7 +94,7 @@ fn main() {
     let num_aio_threads = matches.value_of("num-aio-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-aio-threads'");
     let num_tcp_threads = matches.value_of("num-tcp-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-tcp-threads'");
     let max_io_depth = matches.value_of("max-io-depth").unwrap_or("64").parse::<usize>().expect("Could not parse 'max-io-depth'");
-    let short_circuit_reads = matches.is_present("short-circuit-reads");
+    let _short_circuit_reads = matches.is_present("short-circuit-reads");
 
 
     let datafile_path = data_dir.join("protostore.data".to_owned());
@@ -272,9 +268,7 @@ fn handle_client(toc: Arc<TableOfContents>,
                     rx.then(move |res| {
                         match res {
                             Ok(Ok((buf, _))) => {
-                                let pad_start = offset - aligned_offset;
-                                let body = buf.freeze().slice(pad_left as usize,
-                                                              pad_left as usize + len as usize);
+                                let body = buf.freeze().slice(pad_left as usize, pad_left as usize + len as usize);
                                 let res = Response { id: req.id, body: body };
                                 future::ok(res)
                             },
@@ -321,7 +315,7 @@ fn handle_client(toc: Arc<TableOfContents>,
                     aio_channel.clone().send(aio::Message::PRead(file, aligned_offset as usize, aligned_len as usize, mybuf, tx)).wait();
                     rx.then(move |res| {
                         match res {
-                            Ok(Ok((buf, err))) => {
+                            Ok(Ok((buf, _))) => {
                                 let existing = buf.freeze();
                                 let left = existing.slice(0, pad_left as usize);
                                 let right = existing.slice((pad_left + len as u64) as usize, aligned_len as usize);
@@ -414,78 +408,4 @@ fn bind_thread_to_processing_unit(thread: libc::pthread_t, idx: usize) {
         None => panic!("No processing unit found for idx {}", idx)
     };
     topo.set_cpubind_for_thread(thread, bind_to, CPUBIND_THREAD).expect("Could not set cpubind for thread");
-}
-
-
-
-
-
-
-#[derive(Debug)]
-enum Metric {
-    Incr(String),
-    Timing(String, u64)
-}
-
-type MetricHandle = Arc<std_mpsc::Sender<Metric>>;
-
-fn start_metrics_reporter() -> MetricHandle {
-
-    //let (channel_tx, channel_rx) = mpsc::channel();
-    let (metrics_tx, metrics_rx) = std_mpsc::channel();
-
-    thread::Builder::new().name("metrics_reporter".to_string()).spawn(move || {
-        info!("Creating thread for reporting metrics");
-
-        let timeout = Duration::new(1, 0);
-
-        let mut previous_counters: HashMap<String, u64> = HashMap::new();
-        let mut current_counters: HashMap<String, u64> = HashMap::new();
-        let default_count: u64 = 0;
-
-
-        let last_report_ts = SystemTime::now();
-
-        loop {
-            if let Ok(msg) = metrics_rx.recv_timeout(timeout) {
-                match msg {
-                    Metric::Incr(name) => {
-                        let entry = current_counters.entry(name).or_insert(0);
-                        *entry += 1;
-                    }
-                    Metric::Timing(name, time) => {
-                        println!("time {} {}", name, time);
-                    }
-                }
-            };
-
-            let elapsed = last_report_ts.elapsed().expect("Time drift!");
-            let elapsed_ms = ((elapsed.as_secs() * 1_000_000_000) + elapsed.subsec_nanos() as u64) / 1000000;
-
-            if elapsed_ms >= 1000 {
-                let report = current_counters.len() > 0;
-
-                for (name, current) in current_counters.iter_mut() {
-                    let previous = previous_counters.entry(name.clone()).or_insert(default_count);
-                    if *current > 0 {
-                        let rate: f64 = (*current - *previous) as f64 / elapsed_ms as f64;
-                        print!("{}:{}", name, rate);
-
-                        *previous = *current;
-                        *current = 0;
-                    }
-                };
-                if report {
-                    print!("\n");
-                }
-
-                current_counters = current_counters.into_iter()
-                    .filter(|&(_, count)| count > 0)
-                    .collect();
-
-            }
-        }
-    });
-
-    Arc::new(metrics_tx)
 }

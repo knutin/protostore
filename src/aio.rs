@@ -1,12 +1,9 @@
-use futures::sync::mpsc::{channel};
-use std::thread::{self, JoinHandle};
-
 use std::io;
+use std::default::Default;
+use std::thread::{self, JoinHandle};
+use std::time::SystemTime;
 
 use mio;
-
-use libc;
-
 use futures::{Future, Async, Poll};
 use futures::{oneshot, Complete};
 use futures::stream::{Stream, Fuse};
@@ -20,13 +17,13 @@ use std::os::unix::io::AsRawFd;
 use libaio::raw::{Iocontext, IoOp};
 use libaio::directio::DirectFile;
 
+use libc;
 use slab::Slab;
 
 #[derive(Debug)]
 pub enum Message {
     PRead(DirectFile, usize, usize, BytesMut, Complete<io::Result<(BytesMut, Option<io::Error>)>>),
     PWrite(DirectFile, usize, BytesMut, Complete<io::Result<(BytesMut, Option<io::Error>)>>),
-    Ping(Complete<io::Result<u8>>)
 }
 
 
@@ -48,7 +45,7 @@ impl Session {
     pub fn new(max_queue_depth: usize) -> io::Result<Session> {
 
         // Users of session interact with us by sending messages.
-        let (tx, rx) = channel::<Message>(max_queue_depth);
+        let (tx, rx) = mpsc::channel::<Message>(max_queue_depth);
 
         let (tid_tx, tid_rx) = oneshot();
 
@@ -86,6 +83,9 @@ impl Session {
                 stream: stream,
                 handles_pread: Slab::with_capacity(max_queue_depth),
                 handles_pwrite: Slab::with_capacity(max_queue_depth),
+
+                last_report_ts: SystemTime::now(),
+                stats: AioStats { ..Default::default() }
             };
 
             core.run(fut).unwrap();
@@ -109,13 +109,26 @@ struct AioThread {
 
     // Handles to outstanding requests
     handles_pread: Slab<HandleEntry>,
-    handles_pwrite: Slab<HandleEntry>
+    handles_pwrite: Slab<HandleEntry>,
+
+    last_report_ts: SystemTime,
+    stats: AioStats
 }
 
 struct HandleEntry {
     complete: Complete<io::Result<(BytesMut, Option<io::Error>)>>
 }
 
+
+#[derive(Default)]
+struct AioStats {
+    curr_polls: u64,
+    curr_preads: u64,
+    curr_pwrites: u64,
+    prev_polls: u64,
+    prev_preads: u64,
+    prev_pwrites: u64,
+}
 
 
 impl Future for AioThread {
@@ -125,6 +138,7 @@ impl Future for AioThread {
     fn poll(&mut self) -> Poll<(), io::Error> {
         trace!("============ AioThread.poll (inflight_preads:{} inflight_pwrites:{})",
                self.handles_pread.len(), self.handles_pwrite.len());
+        self.stats.curr_polls += 1;
 
         // If there are any responses from the kernel available, read
         // as many as we can without blocking.
@@ -169,9 +183,6 @@ impl Future for AioThread {
         };
 
 
-        let mut new_pread = 0;
-        let mut new_pwrite = 0;
-
         // Read all available incoming requests, enqueue in AIO batch
         loop {
             let msg = match self.rx.poll().expect("cannot fail") {
@@ -182,7 +193,7 @@ impl Future for AioThread {
 
             match msg {
                 Message::PRead(file, offset, len, buf, complete) => {
-                    new_pread += 1;
+                    self.stats.curr_preads += 1;
 
                     let entry = self.handles_pread.vacant_entry().expect("No more free pread handles!");
                     let index = entry.index();
@@ -198,7 +209,7 @@ impl Future for AioThread {
                 },
 
                 Message::PWrite(file, offset, buf, complete) => {
-                    new_pwrite += 1;
+                    self.stats.curr_pwrites += 1;
 
                     let entry = self.handles_pwrite.vacant_entry().expect("No more free pwrite handles!");
                     let index = entry.index();
@@ -212,17 +223,11 @@ impl Future for AioThread {
                         }
                     }
                 },
-
-                Message::Ping(complete) => {
-                    complete.send(Ok(42)).expect("Could not send AioThread Ping response");
-                }
             }
 
             // TODO: If max queue depth is reached, do not receive any
             // more messages, will cause clients to block
         }
-        trace!("    new_pread:{} new_pwrite:{}", new_pread, new_pwrite);
-
 
 
         // TODO: Need busywait for submit timeout
@@ -234,12 +239,43 @@ impl Future for AioThread {
             }
         }
 
-
         let need_read = self.handles_pread.len() > 0 || self.handles_pwrite.len() > 0;
         if need_read {
             trace!("    calling stream.need_read()");
             self.stream.need_read();
         }
+
+
+        // Print some useful stats
+        if self.stats.curr_polls % 1000 == 0 {
+
+            let elapsed = self.last_report_ts.elapsed().expect("Time drift!");
+            let elapsed_ms = ((elapsed.as_secs() * 1_000_000_000) as f64 + elapsed.subsec_nanos() as f64) / 1000000.0;
+
+            let polls            = self.stats.curr_polls            - self.stats.prev_polls;
+            let preads           = self.stats.curr_preads           - self.stats.prev_preads;
+            let pwrites          = self.stats.curr_pwrites          - self.stats.prev_pwrites;
+            let preads_inflight  = self.handles_pread.len();
+            let pwrites_inflight = self.handles_pwrite.len();
+
+            let thread_id =  unsafe { libc::pthread_self() };
+            info!("threadid:{} polls:{:.0}/sec preads:{:.0}/sec pwrites:{:.0}/sec, inflight:({},{}) reqs/poll:{}",
+                  thread_id,
+                  polls as f64 / elapsed_ms * 1000.0,
+                  preads as f64 / elapsed_ms * 1000.0,
+                  pwrites as f64 / elapsed_ms * 1000.0,
+                  preads_inflight,
+                  pwrites_inflight,
+                  (preads as f64 + pwrites as f64) / polls as f64
+            );
+
+            self.stats.prev_polls            = self.stats.curr_polls;
+            self.stats.prev_preads           = self.stats.curr_preads;
+            self.stats.prev_pwrites          = self.stats.curr_pwrites;
+
+            self.last_report_ts = SystemTime::now();
+        }
+
 
         // Run forever
         Ok(Async::NotReady)

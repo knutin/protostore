@@ -10,7 +10,7 @@ pub struct TableOfContents {
     uuids: Vec<[u8; 16]>,
     offsets: Vec<u64>,
     lens: Vec<u16>,
-    files: Vec<memmap::Mmap>
+    _files: Vec<memmap::Mmap>
 }
 
 
@@ -54,9 +54,9 @@ impl TableOfContents {
             from_raw_parts(lens.as_ptr(), num_entries as usize).to_vec()
         };
 
-        let files = vec![uuid_mmap, offsets_mmap, lens_mmap];
+        let _files = vec![uuid_mmap, offsets_mmap, lens_mmap];
 
-        Ok(TableOfContents { uuids, offsets, lens, files })
+        Ok(TableOfContents { uuids, offsets, lens, _files })
     }
 
 
@@ -65,10 +65,6 @@ impl TableOfContents {
             Ok(index) => Some((self.offsets[index], self.lens[index])),
             Err(_) => None
         }
-    }
-
-    pub fn has_uuid(&self, uuid: &[u8; 16]) -> bool {
-        self.uuids.binary_search(uuid).is_ok()
     }
 
     pub fn max_len(&self) -> usize {
