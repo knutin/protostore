@@ -113,11 +113,11 @@ hammer(protostore, Sock, ReqId, InflightReqs, MaxInflight, Toc, Pos, MaxPos, Tim
                     Uuid = binary:part(Uuids, Pos*16, 16),
                     Now = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
 
-                    ok = gen_tcp:send(Sock, <<ReqId:32/unsigned-integer, Uuid/binary>>),
+                    ok = gen_tcp:send(Sock, <<(1+16+4):32/unsigned-integer, "R", Uuid/binary, ReqId:32/unsigned-integer>>),
                     InflightReqs1 = maps:put(ReqId, Now, InflightReqs),
 
                     {InflightReqs2, NewTimings, NewLens} = recv(Sock, InflightReqs1, Timings, Lens),
-                    NewPos = random:uniform(MaxPos),
+                    NewPos = rand:uniform(MaxPos),
                     hammer(protostore, Sock, ReqId+1, InflightReqs2, MaxInflight, Toc, NewPos, MaxPos, NewTimings, NewLens)
             end
     end;
@@ -202,12 +202,11 @@ parse(Sock, Data, Inflight, Timings, Lens) ->
         <<>> ->
             {Inflight, Timings, Lens};
 
-        <<_:32/unsigned-integer,  0:32/unsigned-integer, _/binary>> ->
+        <<_:32/unsigned-integer,  0:16/unsigned-integer, _/binary>> ->
             io:format("bad data: ~p~n", [Data]),
             throw(bad_response);
 
-        <<ReqId:32/unsigned-integer,  Len:32/unsigned-integer, Body/binary>> ->
-            %%io:format("req id ~p, len ~p, body ~p~n", [ReqId, Len, byte_size(Body)]),
+        <<ReqId:32/unsigned-integer, Len:16/unsigned-integer, Body/binary>> ->
             case byte_size(Body) >= Len of
                 true ->
                     <<_ResponseBody:Len/binary, Rest/binary>> = Body,

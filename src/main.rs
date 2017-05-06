@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, Duration};
 use std::thread;
 use std::collections::HashMap;
+use std::cmp;
 
 use futures::{future, Future, BoxFuture, Sink};
 use futures::stream::Stream;
@@ -38,7 +39,7 @@ use libaio::directio::{DirectFile, Mode, FileAccess};
 use tokio_core::reactor::{Core, Remote};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
-use tokio_io::codec::{Decoder, Encoder};
+
 
 use bytes::{Buf, BufMut, BytesMut, Bytes, IntoBuf};
 use byteorder::{BigEndian};
@@ -50,9 +51,13 @@ use clap::{App, Arg};
 use libaio::FD;
 
 use toc::TableOfContents;
+use protocol::{Protocol, Request, RequestType, Response};
+
+
 
 mod aio;
 mod toc;
+mod protocol;
 
 
 
@@ -124,12 +129,14 @@ fn main() {
     let mut aio_sessions = vec![];
     let aio_sessions_index = AtomicUsize::new(0);
 
-    for _ in 0..num_aio_threads {
-        info!("Creating event loop for receiving AIO responses from the kernel");
-
+    for i in 0..num_aio_threads {
         let session = aio::Session::new(max_io_depth).expect("Could not create aio::Session");
-        bind_thread_to_processing_unit(session.thread_id(), pu_index);
-        //pu_index += 1;
+
+        let pu = cmp::min(pu_index, processing_units.len()-1);
+        bind_thread_to_processing_unit(session.thread_id(), pu);
+        pu_index += 1;
+
+        info!("aio_loop id:{} processing_unit:{}", i, pu);
 
         aio_sessions.push(session);
     }
@@ -144,13 +151,14 @@ fn main() {
     let (remote_tx, remote_rx) = std_mpsc::channel();
 
     let mut tcp_threads = vec![];
-    for _ in 0..num_tcp_threads {
-        info!("Creating event loop for handling TCP communications with clients");
+    for i in 0..num_tcp_threads {
+        let pu = cmp::min(pu_index, processing_units.len()-1);
+        pu_index += 1;
+        info!("tcp_loop id:{} processing_unit:{}", i, pu);
 
         let remote_tx = remote_tx.clone();
         let tid = thread::spawn(move || {
-            bind_thread_to_processing_unit(unsafe { libc::pthread_self() }, pu_index);
-            //pu_index += 1;
+            bind_thread_to_processing_unit(unsafe { libc::pthread_self() }, pu);
 
             let mut core = Core::new().unwrap();
             remote_tx.send(core.remote()).unwrap();
@@ -188,7 +196,7 @@ fn main() {
     let fut = listener.incoming().for_each(move |(socket, addr)| {
         info!("Got new connection from {}", addr);
 
-        let datafile = DirectFile::open(datafile_path.clone(), Mode::Open, FileAccess::Read, 4096)
+        let datafile = DirectFile::open(datafile_path.clone(), Mode::Open, FileAccess::ReadWrite, 4096)
             .expect("Could not open data file with O_DIRECT");
 
 
@@ -220,52 +228,6 @@ fn main() {
 
 
 
-#[derive(Debug)]
-struct Request {
-    id: u32,
-    uuid: [u8; 16]
-}
-
-#[derive(Debug)]
-struct Response {
-    id: u32,
-    len: usize,
-    body: Bytes
-}
-
-struct Protocol;
-
-impl Decoder for Protocol {
-    type Item = Request;
-    type Error = io::Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Request>> {
-        if buf.len() < 20 {
-            return Ok(None)
-        }
-
-        let id = buf.split_to(4).into_buf().get_u32::<BigEndian>();
-        let mut uuid: [u8; 16] = [0; 16];
-        buf.split_to(16).into_buf().copy_to_slice(&mut uuid);
-
-        Ok(Some(Request { id: id, uuid: uuid }))
-    }
-}
-
-impl Encoder for Protocol {
-    type Item = Response;
-    type Error = io::Error;
-
-    fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.reserve(20 + item.len);
-        dst.put_u32::<BigEndian>(item.id);
-        dst.put_u32::<BigEndian>(item.len as u32);
-        dst.put_slice(&item.body.slice(0, item.len));
-        Ok(())
-    }
-}
-
-
 // Handle a single client. Receive request for an uuid, look up offset
 // and length in table of contents, read the value from disk, send
 // response to client.
@@ -275,15 +237,15 @@ fn handle_client(toc: Arc<TableOfContents>,
                  max_value_len: usize,
                  aio: &aio::Session) -> BoxFuture<(), io::Error> {
 
-    // Create a buffer to hold values read from disk
-    let aligned_max_len = max_value_len + (max_value_len % 512);
+    // Create a buffer to hold values read from disk or the client
+    let aligned_max_len = cmp::max(512, max_value_len + (max_value_len % 512));
     let mut buf = BytesMut::with_capacity(aligned_max_len*2);
     unsafe { buf.set_len(aligned_max_len*2) };
 
     let buf = buf.clone();
     let aio_channel = aio.inner.clone();
 
-    let framed = socket.framed(Protocol);
+    let framed = socket.framed(Protocol { len: None });
     let (writer, reader) = framed.split();
 
     let responses = reader.and_then(move |req| {
@@ -292,48 +254,114 @@ fn handle_client(toc: Arc<TableOfContents>,
 
         // Poor-man-clone of DirectFile
         let fd = file.as_raw_fd();
-        let file = DirectFile { fd: FD::new(fd), alignment: file.alignment};
+        let file_alignment = file.alignment;
+        let file = DirectFile { fd: FD::new(fd), alignment: file_alignment};
 
-        if let Some((offset, len)) = toc.offset_and_len(&req.uuid) {
-            let aligned_offset = offset - (offset % 512);
-            let aligned_len = len + 512 - (len % 512);
+        trace!("reqtype:{:?} uuid:{:?}", req.reqtype, req.uuid);
 
-            let (tx, rx) = futures::oneshot();
-            trace!("creating msg");
-            aio_channel.send(aio::Message::PRead(file, 0, 512, mybuf, tx)).wait();
-            rx.then(move |res| {
-                match res {
-                    Ok(Ok((buf, err))) => {
-                        let pad_start = offset - aligned_offset;
-                        let buflen = if err.is_none() { len as usize } else { 0 };
-                        let body = buf.freeze().slice(pad_start as usize, pad_start as usize + buflen);
-                        let res = Response {
-                            id: req.id,
-                            len: buflen,
-                            body: body
-                        };
+        match req.reqtype {
+            RequestType::Read => {
+                if let Some((offset, len)) = toc.offset_and_len(&req.uuid) {
+                    let aligned_offset = offset - (offset % 512);
+                    let pad_left = offset - aligned_offset;
+                    let padded = pad_left + len as u64;
+                    let aligned_len = cmp::max(512, padded + 512 - (padded as u64 % 512));
 
-                        future::ok(res)
-                    },
-                    Ok(Err(e)) => {
-                        panic!("aio failed: {:?}", e)
-                    },
-                    Err(e) => {
-                        panic!("aio failed: {:?}", e)
-                    }
+                    let (tx, rx) = futures::oneshot();
+                    aio_channel.send(aio::Message::PRead(file, aligned_offset as usize, aligned_len as usize, mybuf, tx)).wait();
+                    rx.then(move |res| {
+                        match res {
+                            Ok(Ok((buf, _))) => {
+                                let pad_start = offset - aligned_offset;
+                                let body = buf.freeze().slice(pad_left as usize,
+                                                              pad_left as usize + len as usize);
+                                let res = Response { id: req.id, body: body };
+                                future::ok(res)
+                            },
+                            Ok(Err(e)) => {
+                                panic!("aio failed: {:?}", e)
+                            },
+                            Err(e) => {
+                                panic!("aio failed: {:?}", e)
+                            }
+                        }
+                    }).boxed()
+
+                } else {
+                    let res = Response { id: req.id, body: Bytes::new() };
+                    future::ok(res).boxed()
                 }
-            }).boxed()
+            },
+            RequestType::Write => {
+                let reqid = req.id;
+                let body = req.body.unwrap();
 
-        } else {
-            let res = Response {
-                id: req.id,
-                len: 0,
-                body: Bytes::new()
-            };
+                if let Some((offset, len)) = toc.offset_and_len(&req.uuid) {
+                    // For the sake of simplicity in this prototype,
+                    // we only allow overwriting the full body already
+                    // stored. It must be exactly the same length.
 
-            future::ok(res).boxed()
+                    if body.len() != len as usize {
+                        panic!("unexpected length of body: {}, expected: {}", body.len(), len);
+                    }
 
-            //Err(io::Error::new(io::ErrorKind::Other, "Uuid not found"))
+
+                    // Since we must do aligned writes, we first need
+                    // to read the existing value to get the bytes
+                    // surrounding it. We can then place these
+                    // surrounding bytes into our aligned buffer and
+                    // write it back.
+
+                    let aligned_offset = offset - (offset % 512);
+                    let pad_left = offset - aligned_offset;
+                    let padded = pad_left + len as u64;
+                    let aligned_len = cmp::max(512, padded + 512 - (padded as u64 % 512));
+
+                    let (tx, rx) = futures::oneshot();
+                    aio_channel.clone().send(aio::Message::PRead(file, aligned_offset as usize, aligned_len as usize, mybuf, tx)).wait();
+                    rx.then(move |res| {
+                        match res {
+                            Ok(Ok((buf, err))) => {
+                                let existing = buf.freeze();
+                                let left = existing.slice(0, pad_left as usize);
+                                let right = existing.slice((pad_left + len as u64) as usize, aligned_len as usize);
+
+                                let new: Bytes = left.into_buf().chain(body.into_buf().chain(right)).collect();
+                                let new: BytesMut = new.try_mut().expect("Could not convert 'new' into BytesMut");
+
+                                // Poor-man-clone of DirectFile
+                                let file = DirectFile { fd: FD::new(fd), alignment: file_alignment};
+                                let (tx, rx) = futures::oneshot();
+                                aio_channel.clone().send(aio::Message::PWrite(file, aligned_offset as usize, new, tx)).wait();
+                                rx.then(move |res| {
+                                   match res {
+                                       Ok(Ok(_)) => {
+                                           let res = Response { id: reqid, body: Bytes::new() };
+                                           future::ok(res)
+                                       },
+                                       Ok(Err(e)) => {
+                                           panic!("aio failed: {:?}", e)
+                                       },
+                                       Err(e) => {
+                                           panic!("aio failed: {:?}", e)
+                                       }
+                                   }
+                                }).boxed()
+                            },
+                            Ok(Err(e)) => {
+                                panic!("aio failed: {:?}", e)
+                            },
+                            Err(e) => {
+                                panic!("aio failed: {:?}", e)
+                            }
+                        }
+                    }).boxed()
+
+                } else {
+                    let res = Response { id: reqid, body: Bytes::new() };
+                    future::ok(res).boxed()
+                }
+            }
         }
     });
 
@@ -358,7 +386,7 @@ fn handle_client(toc: Arc<TableOfContents>,
                 future::ok(())
             },
             Err(e) => {
-                println!("Error {}", e);
+                warn!("Connection closed with error: {}", e);
                 future::ok(())
             }
         }
@@ -366,14 +394,6 @@ fn handle_client(toc: Arc<TableOfContents>,
 }
 
 
-
-fn cpuset_for_core(topology: &Topology, idx: usize) -> CpuSet {
-    let cores = (*topology).objects_with_type(&ObjectType::PU).unwrap();
-    match cores.get(idx) {
-        Some(val) => val.cpuset().unwrap(),
-        None => panic!("No Core found with id {}", idx),
-    }
-}
 
 fn hwloc_processing_units() -> Vec<CpuSet> {
     let topo = Topology::new();
@@ -393,7 +413,6 @@ fn bind_thread_to_processing_unit(thread: libc::pthread_t, idx: usize) {
         Some(val) => val.cpuset().unwrap(),
         None => panic!("No processing unit found for idx {}", idx)
     };
-    info!("Binding thread to {:?}", bind_to);
     topo.set_cpubind_for_thread(thread, bind_to, CPUBIND_THREAD).expect("Could not set cpubind for thread");
 }
 

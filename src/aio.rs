@@ -25,6 +25,7 @@ use slab::Slab;
 #[derive(Debug)]
 pub enum Message {
     PRead(DirectFile, usize, usize, BytesMut, Complete<io::Result<(BytesMut, Option<io::Error>)>>),
+    PWrite(DirectFile, usize, BytesMut, Complete<io::Result<(BytesMut, Option<io::Error>)>>),
     Ping(Complete<io::Result<u8>>)
 }
 
@@ -122,20 +123,21 @@ impl Future for AioThread {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<(), io::Error> {
-        trace!("AioThread.poll");
+        trace!("============ AioThread.poll (inflight_preads:{} inflight_pwrites:{})",
+               self.handles_pread.len(), self.handles_pwrite.len());
 
         // If there are any responses from the kernel available, read
         // as many as we can without blocking.
         if self.stream.poll_read().is_ready() {
-            trace!("eventfd is ready, calling io_getevents. {} inflight pread", self.handles_pread.len());
             match self.ctx.results(0, 100, None) {
                 Ok(res) => {
-                    trace!("got {} AIO responses", res.len());
+                    trace!("    got {} AIO responses", res.len());
                     for (op, result) in res.into_iter() {
-                        match result {
-                            Ok(_) => {
-                                match op {
-                                    IoOp::Pread(retbuf, token) => {
+                        match op {
+                            IoOp::Pread(retbuf, token) => {
+                                trace!("    got pread response, token {}, is error? {}", token, result.is_err());
+                                match result {
+                                    Ok(_) => {
                                         let entry = self.handles_pread.remove(token).unwrap();
                                         //let elapsed = entry.timestamp.elapsed().expect("Time drift!");
                                         //trace!("pread returned in {} us", ((elapsed.as_secs() * 1_000_000_000) + elapsed.subsec_nanos() as u64) / 1000);
@@ -143,10 +145,21 @@ impl Future for AioThread {
                                         //entry.complete.send(Ok((retbuf, None))).expect("Could not send AioSession response");
                                         entry.complete.send(Ok((retbuf, None)));
                                     },
-                                    _ => ()
+                                    Err(e) => panic!("pread error {:?}", e)
                                 }
                             },
-                            Err(e) => panic!("error in pread: {:?}", e)
+                            IoOp::Pwrite(retbuf, token) => {
+                                trace!("    got pwrite response, token {}, is error? {}", token, result.is_err());
+
+                                match result {
+                                    Ok(_) => {
+                                        let entry = self.handles_pwrite.remove(token).unwrap();
+                                        entry.complete.send(Ok((retbuf, None)));
+                                    },
+                                    Err(e) => panic!("pwrite error {:?}", e)
+                                }
+                            },
+                            _ => ()
                         }
                     };
                 },
@@ -156,6 +169,9 @@ impl Future for AioThread {
         };
 
 
+        let mut new_pread = 0;
+        let mut new_pwrite = 0;
+
         // Read all available incoming requests, enqueue in AIO batch
         loop {
             let msg = match self.rx.poll().expect("cannot fail") {
@@ -164,13 +180,29 @@ impl Future for AioThread {
                 Async::NotReady => break // AioThread.poll is automatically scheduled
             };
 
-            trace!("AioThread.poll received msg");
-
             match msg {
                 Message::PRead(file, offset, len, buf, complete) => {
+                    new_pread += 1;
+
                     let entry = self.handles_pread.vacant_entry().expect("No more free pread handles!");
                     let index = entry.index();
                     match self.ctx.pread(&file, buf, offset as u64, len, index) {
+                        Ok(()) => {
+                            entry.insert(HandleEntry { complete: complete });
+                        },
+                        Err((buf, _token)) => {
+                            complete.send(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed")))))
+                                .expect("Could not send AioThread error response");
+                        }
+                    }
+                },
+
+                Message::PWrite(file, offset, buf, complete) => {
+                    new_pwrite += 1;
+
+                    let entry = self.handles_pwrite.vacant_entry().expect("No more free pwrite handles!");
+                    let index = entry.index();
+                    match self.ctx.pwrite(&file, buf, offset as u64, index) {
                         Ok(()) => {
                             entry.insert(HandleEntry { complete: complete });
                         },
@@ -189,12 +221,13 @@ impl Future for AioThread {
             // TODO: If max queue depth is reached, do not receive any
             // more messages, will cause clients to block
         }
+        trace!("    new_pread:{} new_pwrite:{}", new_pread, new_pwrite);
 
-        trace!("ctx.batched() {}", self.ctx.batched());
+
 
         // TODO: Need busywait for submit timeout
 
-
+        trace!("    batch size {}", self.ctx.batched());
         while self.ctx.batched() > 0 {
             if let Err(e) = self.ctx.submit() {
                 panic!("batch submit failed {:?}", e);
@@ -202,11 +235,11 @@ impl Future for AioThread {
         }
 
 
-        if self.handles_pread.len() > 0 {
-            trace!("inflight {}, calling stream.need_read()", self.handles_pread.len());
+        let need_read = self.handles_pread.len() > 0 || self.handles_pwrite.len() > 0;
+        if need_read {
+            trace!("    calling stream.need_read()");
             self.stream.need_read();
         }
-
 
         // Run forever
         Ok(Async::NotReady)
@@ -316,8 +349,8 @@ mod tests {
 
         let session = Session::new(4).unwrap();
 
-        let handle1 = session.handle();
-        let handle2 = session.handle();
+        //let handle1 = session.handle();
+        //let handle2 = session.handle();
 
         // let reads = (0..5).map(|_| {
         //     println!("foo");

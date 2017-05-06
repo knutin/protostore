@@ -61,7 +61,7 @@ fn main() {
 
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    
+
     let mut toc_uuids_file = opts.open(toc_uuids_path).unwrap();
     let mut toc_offsets_file = opts.open(toc_offsets_path).unwrap();
     let mut toc_lens_file = opts.open(toc_lens_path).unwrap();
