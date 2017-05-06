@@ -17,7 +17,7 @@ pub struct Request {
     pub reqtype: RequestType,
     pub id: u32,
     pub uuid: [u8; 16],
-    pub body: Option<Vec<u8>>
+    pub body: Option<BytesMut>
 }
 
 #[derive(Debug)]
@@ -56,7 +56,7 @@ impl Decoder for Protocol {
                 let mut uuid: [u8; 16] = [0; 16];
                 header.copy_to_slice(&mut uuid);
                 let id = header.get_u32::<BigEndian>();
-                let body: Vec<u8> = buf.split_to(self.len.unwrap() - (1+16+4)).into_buf().collect();
+                let body = buf.split_to(self.len.unwrap() - (1+16+4));
 
                 self.len = None;
                 Ok(Some(Request {
@@ -118,7 +118,7 @@ mod tests {
         let mut buf = BytesMut::with_capacity(128);
         let uuid = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
         let reqid = 42;
-        let data: Vec<u8> = vec![0, 2, 4, 8];
+        let data = BytesMut::from(vec![0, 2, 4, 8]);
 
         buf.put_u32::<BigEndian>(1+16+4+data.len() as u32);
         buf.put(b'W');
