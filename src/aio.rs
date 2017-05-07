@@ -247,7 +247,7 @@ impl Future for AioThread {
 
 
         // Print some useful stats
-        if self.stats.curr_polls % 1000 == 0 {
+        if self.stats.curr_polls % 10000 == 0 {
 
             let elapsed = self.last_report_ts.elapsed().expect("Time drift!");
             let elapsed_ms = ((elapsed.as_secs() * 1_000_000_000) as f64 + elapsed.subsec_nanos() as f64) / 1000000.0;
@@ -259,7 +259,7 @@ impl Future for AioThread {
             let pwrites_inflight = self.handles_pwrite.len();
 
             let thread_id =  unsafe { libc::pthread_self() };
-            info!("threadid:{} polls:{:.0}/sec preads:{:.0}/sec pwrites:{:.0}/sec, inflight:({},{}) reqs/poll:{}",
+            info!("threadid:{} polls:{:.0}/sec preads:{:.0}/sec pwrites:{:.0}/sec, inflight:({},{}) reqs/poll:{:.2}",
                   thread_id,
                   polls as f64 / elapsed_ms * 1000.0,
                   preads as f64 / elapsed_ms * 1000.0,

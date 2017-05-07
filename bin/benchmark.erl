@@ -1,4 +1,6 @@
 #!/usr/bin/env escript
+%%! +Ktrue
+
 %% Localhost
 %% bin/benchmark.erl protostore 127.0.0.1 12345 2 2 10 /mnt/data/protostore.toc
 %% bin/benchmark.erl redis 127.0.0.1 6379 2 2 10 /mnt/data/protostore.toc
@@ -87,7 +89,6 @@ hammer(ServerType, Sock, MaxInflight, Toc) ->
     InflightReqs = #{},
 
     receive hammertime -> ok end,
-    io:format("Process ~p: It's hammertime!~n", [self()]),
     hammer(ServerType, Sock, ReqId, InflightReqs, MaxInflight, Toc, Position, MaxPos, [], []).
 
 

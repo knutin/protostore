@@ -75,25 +75,23 @@ fn main() {
              .long("num-aio-threads")
              .takes_value(true)
              .help("Number of threads handling AIO communication with the kernel"))
-        .arg(Arg::with_name("num-tcp-thread")
+        .arg(Arg::with_name("num-tcp-threads")
              .long("num-tcp-threads")
              .takes_value(true)
-             .help("Number of threads to use for handling TCP communication with clients.
-                   (In addition to this number, there is a separate thread for accepting socket connections"))
+             .help("Number of threads to use for handling TCP communication with clients. (In addition to this number, there is a separate thread for accepting socket connections"))
         .arg(Arg::with_name("max-io-depth")
              .long("max-io-depth")
              .takes_value(true)
              .help("Max kernel IO queue depth"))
         .arg(Arg::with_name("short-circuit-reads")
              .long("short-circuit-reads")
-             .help("If set, reads will not hit disk but return a default response.
-                   (Useful for testing network throughput)"))
+             .help("If set, reads will not hit disk but return a default response. (Useful for testing network throughput)"))
         .get_matches();
 
     let data_dir = Path::new(matches.value_of("data-dir").unwrap());
     let num_aio_threads = matches.value_of("num-aio-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-aio-threads'");
     let num_tcp_threads = matches.value_of("num-tcp-threads").unwrap_or("1").parse::<usize>().expect("Could not parse 'num-tcp-threads'");
-    let max_io_depth = matches.value_of("max-io-depth").unwrap_or("64").parse::<usize>().expect("Could not parse 'max-io-depth'");
+    let max_io_depth = matches.value_of("max-io-depth").unwrap_or("512").parse::<usize>().expect("Could not parse 'max-io-depth'");
     let short_circuit_reads = matches.is_present("short-circuit-reads");
 
 
@@ -325,8 +323,10 @@ fn handle_client(toc: Arc<TableOfContents>,
                                 let left = existing.slice(0, pad_left as usize);
                                 let right = existing.slice((pad_left + len as u64) as usize, aligned_len as usize);
 
-                                let new: Bytes = left.into_buf().chain(body.into_buf().chain(right)).collect();
-                                let new: BytesMut = new.try_mut().expect("Could not convert 'new' into BytesMut");
+                                let mut new = BytesMut::with_capacity(aligned_len as usize);
+                                new.extend(left);
+                                new.extend(body);
+                                new.extend(right);
 
                                 // Poor-man-clone of DirectFile
                                 let file = DirectFile { fd: FD::new(fd), alignment: file_alignment};

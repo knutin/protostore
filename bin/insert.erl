@@ -3,7 +3,7 @@
 %% bin/insert.erl 127.0.0.1 12345 10 10 /mnt/data/
 
 
--mode(compile).
+-mode(native).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -76,7 +76,6 @@ hammer(Sock, Toc, DummyData) ->
     ReqId = 0,
 
     receive hammertime -> ok end,
-    io:format("Process ~p: It's hammertime!~n", [self()]),
     hammer(Sock, ReqId, Toc, Position, MaxPos, DummyData, [], []).
 
 
@@ -87,35 +86,35 @@ hammer(Sock, ReqId, Toc, Pos, MaxPos, DummyData, Timings, Lens) ->
     after 0 ->
             {Uuids, ValueLens} = Toc,
             Uuid = binary:part(Uuids, Pos*16, 16),
-            <<BodyLen:16/little-integer>> = binary:part(ValueLens, Pos*2, 2),
+            <<BodyLen:16/little-unsigned-integer>> = binary:part(ValueLens, Pos*2, 2),
             Body = binary:part(DummyData, 0, BodyLen),
-            Len = 1+16+4+byte_size(Body),
 
-            Req = <<Len:32/unsigned-integer, "W", Uuid/binary, ReqId:32/unsigned-integer, Body/binary>>,
+            ReqLen = 1+16+4+byte_size(Body),
+            Req = <<ReqLen:32/unsigned-integer, "W", Uuid/binary, ReqId:32/unsigned-integer, Body/binary>>,
             Start = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
             ok = gen_tcp:send(Sock, Req),
-            case gen_tcp:recv(Sock, 0, 1000) of
+            case gen_tcp:recv(Sock, 0, 10000) of
                 {ok, <<ReqId:32/unsigned-integer, 0:16/unsigned-integer>>} ->
                     End = erlang:convert_time_unit(erlang:system_time(), native, microsecond),
                     ElapsedUs = End - Start,
 
                     %% Read our write
-                    ok = gen_tcp:send(Sock, <<(1+16+4):32/unsigned-integer, "R", Uuid/binary, ReqId:32/unsigned-integer>>),
-                    case gen_tcp:recv(Sock, 6, 1000) of
-                        {ok, <<ReqId:32/unsigned-integer, ResponseLen:16/unsigned-integer>>} ->
-                            {ok, ResponseBody} = gen_tcp:recv(Sock, ResponseLen, 1000),
+                    %% ok = gen_tcp:send(Sock, <<(1+16+4):32/unsigned-integer, "R", Uuid/binary, ReqId:32/unsigned-integer>>),
+                    %% case gen_tcp:recv(Sock, 6, 1000) of
+                    %%     {ok, <<ReqId:32/unsigned-integer, ResponseLen:16/unsigned-integer>>} ->
+                    %%         {ok, ResponseBody} = gen_tcp:recv(Sock, ResponseLen, 1000),
 
-                            %%io:format("ResponseLen:~p BodyLen:~p~n", [ResponseLen, BodyLen]),
-                            %%io:format("ResponseBody =:= ExpectedBody: ~p~n", [ResponseBody =:= Body]),
-                            case ResponseBody =:= Body of
-                                true ->
-                                    ok;
-                                false ->
-                                    io:format("Read our write. Expected~n~p~nReceived~n~p~n",
-                                              [Body, ResponseBody]),
-                                    throw(stop)
-                            end
-                    end,
+                    %%         %%io:format("ResponseLen:~p BodyLen:~p~n", [ResponseLen, BodyLen]),
+                    %%         %%io:format("ResponseBody =:= ExpectedBody: ~p~n", [ResponseBody =:= Body]),
+                    %%         case ResponseBody =:= Body of
+                    %%             true ->
+                    %%                 ok;
+                    %%             false ->
+                    %%                 io:format("Read our write. Expected~n~p~nReceived~n~p~n",
+                    %%                           [Body, ResponseBody]),
+                    %%                 throw(stop)
+                    %%         end
+                    %% end,
 
                     NewPos = rand:uniform(MaxPos)-1,
                     %%timer:sleep(1000),
@@ -144,7 +143,7 @@ read_toc(DataDir) ->
 
     Uuids = read_chunk(UuidF, min(10000000*16, UuidTotalSize), UuidTotalSize, 0, []),
     Lens = read_chunk(LensF, min(10000000*8, LensTotalSize), LensTotalSize, 0, []),
-    {iolist_to_binary(Uuids), iolist_to_binary(Lens)}.
+    {iolist_to_binary(lists:reverse(Uuids)), iolist_to_binary(lists:reverse(Lens))}.
 
 
 read_chunk(F, ChunkSize, TotalSize, Position, Toc) ->
@@ -153,7 +152,7 @@ read_chunk(F, ChunkSize, TotalSize, Position, Toc) ->
         true ->
             {ok, Bytes} = file:read(F, MyChunk),
             {ok, NewPos} = file:position(F, Position+MyChunk),
-            read_chunk(F, ChunkSize, TotalSize-MyChunk, NewPos, [Bytes, Toc]);
+            read_chunk(F, ChunkSize, TotalSize-MyChunk, NewPos, [Bytes | Toc]);
         false ->
             Toc
     end.
