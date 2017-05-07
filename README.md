@@ -15,12 +15,12 @@ single `pread` for each read.
 
 A real system with a similar architecture would probably use multiple
 datafiles that are regenerated periodically and a separate buffer for
-storing incoming writes. Reads could hit both the datafile an the
+storing incoming writes. Reads could hit both the datafile and the
 buffer.
 
 When the server starts up I `mmap` the metadata files which contains
 the uuids, offsets and lengths. Obviously this needs to fit in memory,
-but it's not a huge problem since even at 250M keys it would be ~8GB
+but it's not a huge problem since even at 250M keys it is ~8GB
 (32*250M)
 
 The server is multi-threaded and has the following threads:
@@ -43,7 +43,7 @@ The server is multi-threaded and has the following threads:
 
 I implemented a my own `Future` to run the AIO
 threads
-[aio.rs][https://github.com/knutin/protostore/blob/master/src/aio.rs#L134] Here's
+[aio.rs](https://github.com/knutin/protostore/blob/master/src/aio.rs#L134) Here's
 how it works:
 
  1. Read results from the kernel with `io_getevents`. Reply to all
@@ -54,7 +54,7 @@ how it works:
  1. Receive as many requests from tcp threads on a channel as we can
     without blocking. This drains the queue of outstanding requests
     that piled up while we we're doing other work. The future will
-    automatically run again when there's a new message on the channel.
+    automatically run again when there's new messages on the channel.
 
  1. Submit the current batch to the kernel with `io_submit`.
 
@@ -69,11 +69,11 @@ immediately, paying the full price of the syscall. If we have many
 clients issuing many requests, all those requests that arrive at the
 same time will be submitted together, sharing the cost of the
 syscall. Since we always submit as fast as we can, the latency stays
-very low. This is a perfect example of the benefits of public
+low. This is a perfect example of the benefits of public
 transportation vs. everybody having their own car. Read
 about
-[Tarantool][https://medium.com/@denisanikin/asynchronous-processing-with-in-memory-databases-or-how-to-handle-one-million-transactions-per-36a4c01fc4e4] to
-learn more.
+[Tarantool](https://medium.com/@denisanikin/asynchronous-processing-with-in-memory-databases-or-how-to-handle-one-million-transactions-per-36a4c01fc4e4) to
+learn more about this idea.
 
 
 Some interesting projects to check out:
@@ -122,3 +122,13 @@ the same as above.
 ```
 bin/insert.erl 127.0.0.1 12345 50 300 /mnt/data/
 ```
+
+# Is it any good?
+
+I have ran `fio` with a similar setup as `protostore`. While `fio` is
+able to really push the hardware, `protostore` comes close (and it
+also does a bunch of extra work to handle the clients)
+
+the
+[fio output of random-read-write.fio](https://gist.github.com/knutin/a8de6443514222fa7ab276bfc853c61d) to
+[protostore](https://gist.github.com/knutin/59f011cf9eca478a716c1898d8e30799).

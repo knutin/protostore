@@ -1,16 +1,6 @@
 #!/usr/bin/env escript
 %%! +Ktrue
 
-%% Localhost
-%% bin/benchmark.erl protostore 127.0.0.1 12345 2 2 10 /mnt/data/protostore.toc
-%% bin/benchmark.erl redis 127.0.0.1 6379 2 2 10 /mnt/data/protostore.toc
-%%
-%% i3
-%% bin/benchmark.erl protostore 172.18.246.107 12345 2 2 10 /mnt/data/protostore.toc
-%%
-%% r4
-%% bin/benchmark.erl redis 172.18.246.29 6379 2 2 10 redis.toc
-
 -mode(compile).
 
 -include_lib("kernel/include/file.hrl").
