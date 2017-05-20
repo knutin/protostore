@@ -18,6 +18,7 @@ extern crate memmap;
 extern crate hwloc;
 extern crate libc;
 extern crate rand;
+extern crate traildb;
 
 use std::io;
 use std::str;
@@ -29,6 +30,7 @@ use std::cmp;
 
 use futures::{future, Future, BoxFuture, Sink};
 use futures::stream::Stream;
+use futures::sync::mpsc;
 
 
 use std::os::unix::io::AsRawFd;
@@ -38,7 +40,7 @@ use tokio_core::reactor::{Core, Remote};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::AsyncRead;
 
-use bytes::{Buf, BytesMut, Bytes, IntoBuf};
+use bytes::{Buf, BytesMut, Bytes, IntoBuf, BufMut};
 
 use hwloc::{Topology, ObjectType, CPUBIND_THREAD, CpuSet};
 
@@ -49,11 +51,17 @@ use libaio::FD;
 use toc::TableOfContents;
 use protocol::{Protocol, RequestType, Response};
 
-
+use byteorder::LittleEndian;
 
 mod aio;
 mod toc;
 mod protocol;
+
+
+#[derive(Debug)]
+pub enum TdbRequest {
+    Read([u8; 16], BytesMut, futures::Complete<io::Result<BytesMut>>)
+}
 
 
 
@@ -81,13 +89,17 @@ fn main() {
                  .help("Number of threads to use for handling TCP communication \
                     with clients. (In addition to this number, there is a \
                     separate thread for accepting socket connections"))
+        .arg(Arg::with_name("num-tdb-threads")
+                 .long("num-tdb-threads")
+                 .takes_value(true)
+                 .help("Number of threads executing (potentially blocking) TrailDB calls"))
         .arg(Arg::with_name("max-io-depth")
                  .long("max-io-depth")
                  .takes_value(true)
-                 .help("Max kernel IO queue depth"))
+             .help("Max kernel IO queue depth"))
         .arg(Arg::with_name("short-circuit-reads")
-                 .long("short-circuit-reads")
-                 .help("If set, reads will not hit disk but return a default \
+             .long("short-circuit-reads")
+             .help("If set, reads will not hit disk but return a default \
                     response. (Useful for testing network throughput)"))
         .get_matches();
 
@@ -102,6 +114,11 @@ fn main() {
         .unwrap_or("1")
         .parse::<usize>()
         .expect("Could not parse 'num-tcp-threads'");
+    let num_tdb_threads = matches
+        .value_of("num-tdb-threads")
+        .unwrap_or("0")
+        .parse::<usize>()
+        .expect("Could not parse 'num-tdb-threads'");
     let max_io_depth = matches
         .value_of("max-io-depth")
         .unwrap_or("512")
@@ -150,8 +167,6 @@ fn main() {
     }
 
 
-
-
     //
     // Create threads for handling client communications
     //
@@ -181,6 +196,77 @@ fn main() {
 
     let tcp_handles: Vec<Remote> = remote_rx.into_iter().take(num_tcp_threads).collect();
     let tcp_handles_index = AtomicUsize::new(0);
+
+
+
+    //
+    // Create threads for handling TrailDB blocking syscalls
+    //
+    let mut tdb_handles = vec![];
+    let tdb_handles_index = AtomicUsize::new(0);
+
+    for i in 0..num_tdb_threads {
+        let pu = cmp::min(pu_index, processing_units.len() - 1);
+        pu_index += 1;
+        info!("tdb_thread id:{} processing_unit:{}", i, pu);
+
+        let (tx, rx) = mpsc::unbounded();
+        let tid = thread::spawn(move || {
+            bind_thread_to_processing_unit(unsafe { libc::pthread_self() }, pu);
+
+            let tdb = traildb::Db::open(Path::new("/mnt/data/big.tdb"))
+                .expect("Could not open TrailDB at /mnt/data/big.tdb");
+
+            let mut cursor = tdb.cursor();
+
+            for msg in rx.wait() {
+                trace!("tdb thread got {:?}", msg);
+
+                match msg.expect("tdb thread failed receiving msg") {
+                    TdbRequest::Read(uuid, mut buf, complete) => {
+
+                        if let Some(trail_id) = tdb.get_trail_id(&uuid) {
+                            trace!("trail id {:?}", trail_id);
+
+                            cursor.get_trail(trail_id);
+
+                            let mut n = 0;
+                            while let Some(event) = cursor.next() {
+                                trace!("remaining {}, items {}", buf.remaining_mut(), event.items.len());
+                                if buf.remaining_mut() < (event.items.len() * 8) {
+                                    trace!("realloc, reserving {}", event.items.len() * 8);
+                                    buf.reserve(event.items.len() * 8);
+                                }
+
+                                let mut done = false;
+                                for item in event.items {
+                                    buf.put_u64::<LittleEndian>(item.0);
+                                    n += 8;
+                                    //buf.put_u64::<LittleEndian>(n);
+
+                                    if n > 65000 {
+                                        done = true;
+                                    }
+                                }
+
+                                if done {
+                                    break;
+                                }
+
+
+                            }
+                            //buf.put_u32::<LittleEndian>(n);
+                            trace!("wrote {} bytes", n);
+                        }
+                        complete.send(Ok(buf));
+                    }
+                }
+            }
+        });
+        tdb_handles.push(tx);
+    }
+
+
 
     //
     // Create TCP listener which will accept new client connections
@@ -219,21 +305,28 @@ fn main() {
             let ref tcp_remote = tcp_handles[tcp_idx];
             let ref aio_session = aio_sessions[aio_idx];
 
-            let result = handle_client(toc.clone(),
-                                       datafile,
-                                       socket,
-                                       max_value_len,
-                                       aio_session,
-                                       short_circuit_reads)
-                    .map(move |_| {
-                             info!("Connection to {} closed", addr);
-                             ()
-                         })
-                    .map_err(move |_| {
-                                 warn!("Server error in connection to {}", addr);
-                                 ()
-                             });
-            tcp_remote.spawn(|_| result);
+
+            let result = if num_tdb_threads == 0 {
+                handle_client(toc.clone(),
+                              datafile,
+                              socket,
+                              max_value_len,
+                              aio_session,
+                              short_circuit_reads)
+            } else {
+                let tdb_idx = tdb_handles_index.fetch_add(1, Ordering::SeqCst) % num_tdb_threads;
+                let ref tdb_handle = tdb_handles[tdb_idx];
+                handle_client_tdb(tdb_handle, socket)
+            };
+
+            let notype = result.map(move |_| {
+                info!("Connection to {} closed", addr);
+                ()
+            }).map_err(move |_| {
+                warn!("Server error in connection to {}", addr);
+                ()
+            });
+            tcp_remote.spawn(|_| notype);
 
             Ok(())
         });
@@ -268,6 +361,7 @@ fn handle_client(toc: Arc<TableOfContents>,
     let framed = socket.framed(Protocol { len: None });
     let (writer, reader) = framed.split();
 
+
     let responses = reader.and_then(move |req| {
         let mybuf = buf.clone(); // BytesMut.clone()
         let aio_channel = aio_channel.clone();
@@ -300,19 +394,19 @@ fn handle_client(toc: Arc<TableOfContents>,
                                                       tx))
                             .wait();
                         rx.then(move |res| match res {
-                                      Ok(Ok((buf, _))) => {
-                                          let body = buf.freeze()
-                                              .slice(pad_left as usize,
-                                                     pad_left as usize + len as usize);
-                                          let res = Response {
-                                              id: req.id,
-                                              body: body,
-                                          };
-                                          future::ok(res)
-                                      }
-                                      Ok(Err(e)) => panic!("aio failed: {:?}", e),
-                                      Err(e) => panic!("aio failed: {:?}", e),
-                                  })
+                            Ok(Ok((buf, _))) => {
+                                let body = buf.freeze()
+                                    .slice(pad_left as usize,
+                                           pad_left as usize + len as usize);
+                                let res = Response {
+                                    id: req.id,
+                                    body: body,
+                                };
+                                future::ok(res)
+                            }
+                            Ok(Err(e)) => panic!("aio failed: {:?}", e),
+                            Err(e) => panic!("aio failed: {:?}", e),
+                        })
                             .boxed()
                     } else {
                         let res = Response {
@@ -366,48 +460,48 @@ fn handle_client(toc: Arc<TableOfContents>,
                                                   tx))
                         .wait();
                     rx.then(move |res| {
-                            match res {
-                                Ok(Ok((buf, _))) => {
-                                    let existing = buf.freeze();
-                                    let left = existing.slice(0, pad_left as usize);
-                                    let right = existing.slice((pad_left + len as u64) as usize,
-                                                               aligned_len as usize);
+                        match res {
+                            Ok(Ok((buf, _))) => {
+                                let existing = buf.freeze();
+                                let left = existing.slice(0, pad_left as usize);
+                                let right = existing.slice((pad_left + len as u64) as usize,
+                                                           aligned_len as usize);
 
-                                    let mut new = BytesMut::with_capacity(aligned_len as usize);
-                                    new.extend(left);
-                                    new.extend(body);
-                                    new.extend(right);
+                                let mut new = BytesMut::with_capacity(aligned_len as usize);
+                                new.extend(left);
+                                new.extend(body);
+                                new.extend(right);
 
-                                    // Poor-man-clone of DirectFile
-                                    let file = DirectFile {
-                                        fd: FD::new(fd),
-                                        alignment: file_alignment,
-                                    };
-                                    let (tx, rx) = futures::oneshot();
-                                    aio_channel
-                                        .clone()
-                                        .send(aio::Message::PWrite(file,
-                                                                   aligned_offset as usize,
-                                                                   new,
-                                                                   tx))
-                                        .wait();
-                                    rx.then(move |res| match res {
-                                                  Ok(Ok(_)) => {
-                                                      let res = Response {
-                                                          id: reqid,
-                                                          body: Bytes::new(),
-                                                      };
-                                                      future::ok(res)
-                                                  }
-                                                  Ok(Err(e)) => panic!("aio failed: {:?}", e),
-                                                  Err(e) => panic!("aio failed: {:?}", e),
-                                              })
-                                        .boxed()
-                                }
-                                Ok(Err(e)) => panic!("aio failed: {:?}", e),
-                                Err(e) => panic!("aio failed: {:?}", e),
+                                // Poor-man-clone of DirectFile
+                                let file = DirectFile {
+                                    fd: FD::new(fd),
+                                    alignment: file_alignment,
+                                };
+                                let (tx, rx) = futures::oneshot();
+                                aio_channel
+                                    .clone()
+                                    .send(aio::Message::PWrite(file,
+                                                               aligned_offset as usize,
+                                                               new,
+                                                               tx))
+                                    .wait();
+                                rx.then(move |res| match res {
+                                    Ok(Ok(_)) => {
+                                        let res = Response {
+                                            id: reqid,
+                                            body: Bytes::new(),
+                                        };
+                                        future::ok(res)
+                                    }
+                                    Ok(Err(e)) => panic!("aio failed: {:?}", e),
+                                    Err(e) => panic!("aio failed: {:?}", e),
+                                })
+                                    .boxed()
                             }
-                        })
+                            Ok(Err(e)) => panic!("aio failed: {:?}", e),
+                            Err(e) => panic!("aio failed: {:?}", e),
+                        }
+                    })
                         .boxed()
 
                 } else {
@@ -430,6 +524,63 @@ fn handle_client(toc: Arc<TableOfContents>,
                       future::ok(())
                   }
               })
+        .boxed()
+}
+
+// Handle a single client. Receive request for an uuid, look up offset
+// and length in table of contents, read the value from disk, send
+// response to client.
+fn handle_client_tdb(sender: &mpsc::UnboundedSender<TdbRequest>,
+                     socket: TcpStream)
+                     -> BoxFuture<(), io::Error> {
+
+    // Create a buffer to hold values read from disk or the client
+    let mut buf = BytesMut::with_capacity(1024);
+    trace!("created buffer with capacity {}", buf.capacity());
+    trace!("cloned capacity {}", buf.clone().capacity());
+
+    let framed = socket.framed(Protocol { len: None });
+    let (writer, reader) = framed.split();
+
+    let sender = sender.clone();
+
+    let responses = reader.and_then(move |req| {
+        let mut mybuf = buf.clone(); // BytesMut.clone()
+        trace!("reqtype:{:?} uuid:{:?}", req.reqtype, req.uuid);
+
+        assert!(req.reqtype == RequestType::Read);
+
+
+        let (tx, rx) = futures::oneshot();
+        let msg = TdbRequest::Read(req.uuid.clone(), mybuf, tx);
+
+        sender.clone().send(msg).wait();
+
+        rx.then(move |res| match res {
+            Ok(Ok(buf)) => {
+                trace!("tdb tcp got response");
+                let res = Response {
+                    id: req.id,
+                    body: buf.freeze()
+                };
+                future::ok(res)
+            }
+            Ok(Err(e)) => panic!("tdb failed: {:?}", e),
+            Err(e) => panic!("tdb failed: {:?}", e),
+        })
+    });
+
+    writer
+        .send_all(responses)
+        .then(move |result| match result {
+            Ok(_) => {
+                future::ok(())
+            },
+            Err(e) => {
+                warn!("Connection closed with error: {}", e);
+                future::ok(())
+            }
+        })
         .boxed()
 }
 
