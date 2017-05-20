@@ -32,12 +32,12 @@ pub enum Message {
 pub struct Session {
     pub inner: mpsc::Sender<Message>,
     thread: JoinHandle<()>,
-    pthread: libc::pthread_t
+    pthread: libc::pthread_t,
 }
 
 #[derive(Debug, Clone)]
 struct SessionHandle {
-    inner: mpsc::Sender<Message>
+    inner: mpsc::Sender<Message>,
 }
 
 
@@ -60,14 +60,14 @@ impl Session {
 
             let mut ctx = match Iocontext::<usize, BytesMut, BytesMut>::new(max_queue_depth) {
                 Ok(ctx) => ctx,
-                Err(e) => panic!("could not create Iocontext: {}", e)
+                Err(e) => panic!("could not create Iocontext: {}", e),
             };
 
             // Using an eventfd, the kernel can notify us when there's
             // one or more AIO results ready. See 'man eventfd'
             match ctx.ensure_evfd() {
                 Ok(_) => (),
-                Err(e) => panic!("ensure_evfd failed: {}", e)
+                Err(e) => panic!("ensure_evfd failed: {}", e),
             };
             let evfd = ctx.evfd.as_ref().unwrap().clone();
 
@@ -85,7 +85,7 @@ impl Session {
                 handles_pwrite: Slab::with_capacity(max_queue_depth),
 
                 last_report_ts: SystemTime::now(),
-                stats: AioStats { ..Default::default() }
+                stats: AioStats { ..Default::default() },
             };
 
             core.run(fut).unwrap();
@@ -93,7 +93,11 @@ impl Session {
 
         let tid = tid_rx.wait().unwrap();
 
-        Ok(Session { inner: tx, thread: t, pthread: tid })
+        Ok(Session {
+               inner: tx,
+               thread: t,
+               pthread: tid,
+           })
     }
 
     pub fn thread_id(&self) -> libc::pthread_t {
@@ -112,11 +116,11 @@ struct AioThread {
     handles_pwrite: Slab<HandleEntry>,
 
     last_report_ts: SystemTime,
-    stats: AioStats
+    stats: AioStats,
 }
 
 struct HandleEntry {
-    complete: Complete<io::Result<(BytesMut, Option<io::Error>)>>
+    complete: Complete<io::Result<(BytesMut, Option<io::Error>)>>,
 }
 
 
@@ -137,7 +141,8 @@ impl Future for AioThread {
 
     fn poll(&mut self) -> Poll<(), io::Error> {
         trace!("============ AioThread.poll (inflight_preads:{} inflight_pwrites:{})",
-               self.handles_pread.len(), self.handles_pwrite.len());
+               self.handles_pread.len(),
+               self.handles_pwrite.len());
         self.stats.curr_polls += 1;
 
         // If there are any responses from the kernel available, read
@@ -149,7 +154,9 @@ impl Future for AioThread {
                     for (op, result) in res.into_iter() {
                         match op {
                             IoOp::Pread(retbuf, token) => {
-                                trace!("    got pread response, token {}, is error? {}", token, result.is_err());
+                                trace!("    got pread response, token {}, is error? {}",
+                                       token,
+                                       result.is_err());
                                 match result {
                                     Ok(_) => {
                                         let entry = self.handles_pread.remove(token).unwrap();
@@ -158,25 +165,27 @@ impl Future for AioThread {
 
                                         //entry.complete.send(Ok((retbuf, None))).expect("Could not send AioSession response");
                                         entry.complete.send(Ok((retbuf, None)));
-                                    },
-                                    Err(e) => panic!("pread error {:?}", e)
+                                    }
+                                    Err(e) => panic!("pread error {:?}", e),
                                 }
-                            },
+                            }
                             IoOp::Pwrite(retbuf, token) => {
-                                trace!("    got pwrite response, token {}, is error? {}", token, result.is_err());
+                                trace!("    got pwrite response, token {}, is error? {}",
+                                       token,
+                                       result.is_err());
 
                                 match result {
                                     Ok(_) => {
                                         let entry = self.handles_pwrite.remove(token).unwrap();
                                         entry.complete.send(Ok((retbuf, None)));
-                                    },
-                                    Err(e) => panic!("pwrite error {:?}", e)
+                                    }
+                                    Err(e) => panic!("pwrite error {:?}", e),
                                 }
-                            },
-                            _ => ()
+                            }
+                            _ => (),
                         }
-                    };
-                },
+                    }
+                }
 
                 Err(e) => panic!("ctx.results failed: {:?}", e),
             }
@@ -188,41 +197,51 @@ impl Future for AioThread {
             let msg = match self.rx.poll().expect("cannot fail") {
                 Async::Ready(Some(msg)) => msg,
                 Async::Ready(None) => break,
-                Async::NotReady => break // AioThread.poll is automatically scheduled
+                Async::NotReady => break, // AioThread.poll is automatically scheduled
             };
 
             match msg {
                 Message::PRead(file, offset, len, buf, complete) => {
                     self.stats.curr_preads += 1;
 
-                    let entry = self.handles_pread.vacant_entry().expect("No more free pread handles!");
+                    let entry = self.handles_pread
+                        .vacant_entry()
+                        .expect("No more free pread handles!");
                     let index = entry.index();
                     match self.ctx.pread(&file, buf, offset as u64, len, index) {
                         Ok(()) => {
                             entry.insert(HandleEntry { complete: complete });
-                        },
+                        }
                         Err((buf, _token)) => {
-                            complete.send(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed")))))
+                            complete
+                                .send(Ok((buf,
+                                          Some(io::Error::new(io::ErrorKind::Other,
+                                                              "pread failed")))))
                                 .expect("Could not send AioThread error response");
                         }
                     }
-                },
+                }
 
                 Message::PWrite(file, offset, buf, complete) => {
                     self.stats.curr_pwrites += 1;
 
-                    let entry = self.handles_pwrite.vacant_entry().expect("No more free pwrite handles!");
+                    let entry = self.handles_pwrite
+                        .vacant_entry()
+                        .expect("No more free pwrite handles!");
                     let index = entry.index();
                     match self.ctx.pwrite(&file, buf, offset as u64, index) {
                         Ok(()) => {
                             entry.insert(HandleEntry { complete: complete });
-                        },
+                        }
                         Err((buf, _token)) => {
-                            complete.send(Ok((buf, Some(io::Error::new(io::ErrorKind::Other, "pread failed")))))
+                            complete
+                                .send(Ok((buf,
+                                          Some(io::Error::new(io::ErrorKind::Other,
+                                                              "pread failed")))))
                                 .expect("Could not send AioThread error response");
                         }
                     }
-                },
+                }
             }
 
             // TODO: If max queue depth is reached, do not receive any
@@ -250,15 +269,17 @@ impl Future for AioThread {
         if self.stats.curr_polls % 10000 == 0 {
 
             let elapsed = self.last_report_ts.elapsed().expect("Time drift!");
-            let elapsed_ms = ((elapsed.as_secs() * 1_000_000_000) as f64 + elapsed.subsec_nanos() as f64) / 1000000.0;
+            let elapsed_ms = ((elapsed.as_secs() * 1_000_000_000) as f64 +
+                              elapsed.subsec_nanos() as f64) /
+                             1000000.0;
 
-            let polls            = self.stats.curr_polls            - self.stats.prev_polls;
-            let preads           = self.stats.curr_preads           - self.stats.prev_preads;
-            let pwrites          = self.stats.curr_pwrites          - self.stats.prev_pwrites;
-            let preads_inflight  = self.handles_pread.len();
+            let polls = self.stats.curr_polls - self.stats.prev_polls;
+            let preads = self.stats.curr_preads - self.stats.prev_preads;
+            let pwrites = self.stats.curr_pwrites - self.stats.prev_pwrites;
+            let preads_inflight = self.handles_pread.len();
             let pwrites_inflight = self.handles_pwrite.len();
 
-            let thread_id =  unsafe { libc::pthread_self() };
+            let thread_id = unsafe { libc::pthread_self() };
             info!("threadid:{} polls:{:.0}/sec preads:{:.0}/sec pwrites:{:.0}/sec, inflight:({},{}) reqs/poll:{:.2}",
                   thread_id,
                   polls as f64 / elapsed_ms * 1000.0,
@@ -266,12 +287,11 @@ impl Future for AioThread {
                   pwrites as f64 / elapsed_ms * 1000.0,
                   preads_inflight,
                   pwrites_inflight,
-                  (preads as f64 + pwrites as f64) / polls as f64
-            );
+                  (preads as f64 + pwrites as f64) / polls as f64);
 
-            self.stats.prev_polls            = self.stats.curr_polls;
-            self.stats.prev_preads           = self.stats.curr_preads;
-            self.stats.prev_pwrites          = self.stats.curr_pwrites;
+            self.stats.prev_polls = self.stats.curr_polls;
+            self.stats.prev_preads = self.stats.curr_preads;
+            self.stats.prev_pwrites = self.stats.curr_pwrites;
 
             self.last_report_ts = SystemTime::now();
         }
@@ -285,7 +305,7 @@ impl Future for AioThread {
 
 // Register the eventfd with mio
 struct AioEventFd {
-    inner: EventFD
+    inner: EventFD,
 }
 
 impl mio::Evented for AioEventFd {
@@ -293,7 +313,8 @@ impl mio::Evented for AioEventFd {
                 poll: &mio::Poll,
                 token: mio::Token,
                 interest: mio::Ready,
-                opts: mio::PollOpt) -> io::Result<()> {
+                opts: mio::PollOpt)
+                -> io::Result<()> {
         trace!("AioEventFd.register");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).register(poll, token, interest, opts)
     }
@@ -302,7 +323,8 @@ impl mio::Evented for AioEventFd {
                   poll: &mio::Poll,
                   token: mio::Token,
                   interest: mio::Ready,
-                  opts: mio::PollOpt) -> io::Result<()> {
+                  opts: mio::PollOpt)
+                  -> io::Result<()> {
         trace!("AioEventFd.reregister");
         mio::unix::EventedFd(&self.inner.as_raw_fd()).reregister(poll, token, interest, opts)
     }
@@ -368,7 +390,7 @@ mod tests {
         let (mut buf, err) = res.unwrap();
         assert!(err.is_none());
 
-        for i in 0..(512/8) {
+        for i in 0..(512 / 8) {
             assert_eq!(i, buf.split_to(8).into_buf().get_u64::<BigEndian>());
         }
         assert_eq!(0, buf.len());

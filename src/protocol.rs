@@ -9,7 +9,7 @@ use tokio_io::codec::{Decoder, Encoder};
 #[derive(Debug, PartialEq)]
 pub enum RequestType {
     Read,
-    Write
+    Write,
 }
 
 #[derive(Debug)]
@@ -17,16 +17,18 @@ pub struct Request {
     pub reqtype: RequestType,
     pub id: u32,
     pub uuid: [u8; 16],
-    pub body: Option<BytesMut>
+    pub body: Option<BytesMut>,
 }
 
 #[derive(Debug)]
 pub struct Response {
     pub id: u32,
-    pub body: Bytes
+    pub body: Bytes,
 }
 
-pub struct Protocol { pub len: Option<usize> }
+pub struct Protocol {
+    pub len: Option<usize>,
+}
 
 
 
@@ -36,7 +38,7 @@ impl Decoder for Protocol {
 
     fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Request>> {
         if buf.len() < 4 {
-            return Ok(None)
+            return Ok(None);
         }
 
         if self.len.is_none() {
@@ -45,31 +47,31 @@ impl Decoder for Protocol {
         }
 
         if buf.len() < self.len.unwrap() {
-            return Ok(None)
+            return Ok(None);
         }
 
         match buf[0] {
             b'W' => {
-                let mut header = buf.split_to(1+16+4).into_buf();
+                let mut header = buf.split_to(1 + 16 + 4).into_buf();
                 header.advance(1); // skip type
 
                 let mut uuid: [u8; 16] = [0; 16];
                 header.copy_to_slice(&mut uuid);
                 let id = header.get_u32::<BigEndian>();
-                let body = buf.split_to(self.len.unwrap() - (1+16+4));
+                let body = buf.split_to(self.len.unwrap() - (1 + 16 + 4));
 
                 self.len = None;
                 Ok(Some(Request {
-                    reqtype: RequestType::Write,
-                    id: id,
-                    uuid: uuid,
-                    body: Some(body)
-                }))
+                            reqtype: RequestType::Write,
+                            id: id,
+                            uuid: uuid,
+                            body: Some(body),
+                        }))
 
-            },
+            }
 
             b'R' => {
-                let mut buf = buf.split_to(1+16+4).into_buf();
+                let mut buf = buf.split_to(1 + 16 + 4).into_buf();
                 buf.advance(1);
 
                 let mut uuid: [u8; 16] = [0; 16];
@@ -77,11 +79,13 @@ impl Decoder for Protocol {
                 let id = buf.get_u32::<BigEndian>();
 
                 self.len = None;
-                Ok(Some(Request { reqtype: RequestType::Read,
-                                  id: id,
-                                  uuid: uuid,
-                                  body: None }))
-            },
+                Ok(Some(Request {
+                            reqtype: RequestType::Read,
+                            id: id,
+                            uuid: uuid,
+                            body: None,
+                        }))
+            }
 
             any => {
                 panic!("got unexpected request type: {}", any);
@@ -116,17 +120,17 @@ mod tests {
     #[test]
     fn decode_write() {
         let mut buf = BytesMut::with_capacity(128);
-        let uuid = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
+        let uuid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let reqid = 42;
         let data = BytesMut::from(vec![0, 2, 4, 8]);
 
-        buf.put_u32::<BigEndian>(1+16+4+data.len() as u32);
+        buf.put_u32::<BigEndian>(1 + 16 + 4 + data.len() as u32);
         buf.put(b'W');
         buf.put_slice(&uuid);
         buf.put_u32::<BigEndian>(reqid);
         buf.put_slice(&data);
 
-        assert_eq!(4+1+16+4+data.len(), buf.len());
+        assert_eq!(4 + 1 + 16 + 4 + data.len(), buf.len());
 
         let mut proto = Protocol { len: None };
         let decoded = proto.decode(&mut buf);
@@ -143,10 +147,10 @@ mod tests {
     #[test]
     fn decode_read() {
         let mut buf = BytesMut::with_capacity(128);
-        let uuid = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
+        let uuid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let reqid = 42;
 
-        buf.put_u32::<BigEndian>(1+16+4);
+        buf.put_u32::<BigEndian>(1 + 16 + 4);
         buf.put(b'R');
         buf.put_slice(&uuid);
         buf.put_u32::<BigEndian>(reqid);
@@ -164,12 +168,15 @@ mod tests {
 
     #[test]
     fn encode() {
-        let uuid = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1];
+        let uuid = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let reqid = 42;
         let mut body = BytesMut::with_capacity(4);
         body.put_u32::<BigEndian>(45);
 
-        let response = Response { id: reqid, body: body.freeze() };
+        let response = Response {
+            id: reqid,
+            body: body.freeze(),
+        };
 
         let mut proto = Protocol { len: None };
         let mut encoded = BytesMut::with_capacity(128);

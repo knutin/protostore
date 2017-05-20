@@ -143,6 +143,7 @@ fn main() {
             data_buf.extend_from_slice(&dummies[0..(*len as usize)]);
         }
         data_file.write_all(&data_buf).expect("Could not write data_buf to data_file");
+        data_file.sync_all().expect("fsync failed");
         written_bytes += chunk_sum;
     }
 }
